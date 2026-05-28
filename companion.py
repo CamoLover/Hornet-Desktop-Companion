@@ -3,7 +3,9 @@
 companion.py-  Hornet desktop companion.
 ESC to quit.  Left-click drag to throw.  Click on ground to sit / stand.
 """
-import os, sys, math, glob, platform, ctypes, ctypes.util, subprocess, re, random
+import os, sys, math, glob, platform, ctypes, ctypes.util, subprocess, re, random, threading
+from PIL import Image
+from io import BytesIO
 
 PLAT = platform.system()
 
@@ -142,6 +144,33 @@ NEEDOLINE_SEGMENTS = [
     (187, 213),   # architect melody
     (214, 253),   # trial end
 ]
+
+# Song names for tray menu
+SONG_NAMES = [
+    'Default Melody',
+    'Beastling Call',
+    'Elegy of the Deep',
+    'Conductor Melody',
+    'Vaultkeeper Melody',
+    'Architect Melody',
+    'Trial End',
+]
+
+# Global tray control state
+tray_globals = {
+    'running': True,
+    'topmost': True,
+    'volume': 1.0,
+    'current_song': -1,
+    'auto_random_song': True,  # If False, always use current_song when sitting
+}
+
+# Global music state (modified by both main loop and tray)
+has_music     = False
+music_active  = False
+music_seg     = 0
+music_tick    = 0
+music_dur_ms  = 0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # X11 Shape Manager  (ONE connection for the lifetime of the app)
@@ -581,6 +610,107 @@ def render_argb(screen, offscreen, hornet):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tray Icon (Windows only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _create_tray_icon(hwnd, hornet_ref):
+    """Create and run the system tray icon (blocking, run in separate thread)."""
+    try:
+        from pystray import Icon, Menu, MenuItem
+    except ImportError:
+        print("pystray not installed, tray icon disabled")
+        return
+
+    def on_song(song_idx):
+        """Handler for selecting a specific song (song_idx >= 0) or random (-1)."""
+        def handler(icon, item):
+            if song_idx == -1:  # Random
+                tray_globals['auto_random_song'] = True
+                tray_globals['current_song'] = -1
+            else:
+                tray_globals['current_song'] = song_idx
+                tray_globals['auto_random_song'] = False
+            # If hornet is sitting, play immediately
+            if hornet_ref[0] and hornet_ref[0].sitting:
+                start_song_from_tray(song_idx if song_idx >= 0 else random.randrange(len(NEEDOLINE_SEGMENTS)))
+            icon.update_menu()
+        return handler
+
+    def on_volume(vol):
+        def handler(icon, item):
+            tray_globals['volume'] = vol
+            pygame.mixer.music.set_volume(vol)
+        return handler
+
+    def on_quit(icon, item):
+        tray_globals['running'] = False
+        icon.stop()
+
+    # Build volume submenu
+    volume_items = [
+        MenuItem(f'{int(v*100)}%', on_volume(v))
+        for v in [0.0, 0.25, 0.5, 0.75, 1.0]
+    ]
+
+    # Create song submenu - include Random as first option
+    song_items = [
+        MenuItem('Random', on_song(-1)),  # -1 means random
+    ]
+    song_items.extend([
+        MenuItem(SONG_NAMES[i], on_song(i))
+        for i in range(len(SONG_NAMES))
+    ])
+
+    # Build the main menu dynamically
+    def build_menu():
+        return Menu(
+            MenuItem('Songs', Menu(*song_items)),
+            MenuItem('Volume', Menu(*volume_items)),
+            MenuItem('Quit', on_quit),
+        )
+
+    # Create minimal icon image (small hornet)
+    try:
+        icon_img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+        # Try to use the app icon if available
+        for path in ICON_FILES:
+            if os.path.exists(path) and not path.endswith('.ico'):
+                try:
+                    img = Image.open(path).convert('RGBA')
+                    img.thumbnail((64, 64))
+                    icon_img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+                    offset = ((64 - img.width) // 2, (64 - img.height) // 2)
+                    icon_img.paste(img, offset, img)
+                    break
+                except Exception:
+                    pass
+    except Exception:
+        # Fallback: create a simple blue square
+        icon_img = Image.new('RGBA', (64, 64), (0, 0, 255, 255))
+
+    icon = Icon('HornetCompanion', icon_img, menu=build_menu())
+    icon.run()
+
+
+def start_song_from_tray(song_idx):
+    """Called from tray to start a specific song."""
+    global music_active, music_seg, music_tick, music_dur_ms
+    if not has_music:
+        return
+    music_seg = song_idx
+    start_s, end_s = NEEDOLINE_SEGMENTS[music_seg]
+    music_dur_ms = (end_s - start_s) * 1000
+    try:
+        pygame.mixer.music.set_volume(tray_globals['volume'])
+        pygame.mixer.music.load(MUSIC_FILE)
+        pygame.mixer.music.play(start=float(start_s))
+        music_tick = pygame.time.get_ticks()
+        music_active = True
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -676,20 +806,22 @@ def main():
     clock = pygame.time.Clock()
 
     # ── Music state ───────────────────────────────────────────────────────────
+    global has_music, music_active, music_seg, music_tick, music_dur_ms
     has_music     = os.path.exists(MUSIC_FILE)
-    music_active  = False
-    music_seg     = 0      # index into NEEDOLINE_SEGMENTS
-    music_tick    = 0      # ticks() when current segment started playing
-    music_dur_ms  = 0      # duration of current segment in ms
 
     def start_needoline():
-        nonlocal music_active, music_seg, music_tick, music_dur_ms
+        global music_active, music_seg, music_tick, music_dur_ms
         if not has_music:
             return
-        music_seg    = random.randrange(len(NEEDOLINE_SEGMENTS))
+        # If auto_random_song is False and a song is selected, use it
+        if not tray_globals['auto_random_song'] and tray_globals['current_song'] >= 0:
+            music_seg = tray_globals['current_song']
+        else:
+            music_seg = random.randrange(len(NEEDOLINE_SEGMENTS))
         start_s, end_s = NEEDOLINE_SEGMENTS[music_seg]
         music_dur_ms = (end_s - start_s) * 1000
         try:
+            pygame.mixer.music.set_volume(tray_globals['volume'])
             pygame.mixer.music.load(MUSIC_FILE)
             pygame.mixer.music.play(start=float(start_s))
             music_tick   = pygame.time.get_ticks()
@@ -698,13 +830,24 @@ def main():
             pass
 
     def stop_needoline():
-        nonlocal music_active
+        global music_active
         if music_active:
             pygame.mixer.music.stop()
             music_active = False
 
+    # ── Tray icon (Windows only) ──────────────────────────────────────────────
+    hornet_ref = [hornet]  # Mutable reference for tray thread
+    tray_thread = None
+    if PLAT == 'Windows':
+        tray_thread = threading.Thread(
+            target=_create_tray_icon,
+            args=(hwnd, hornet_ref),
+            daemon=True
+        )
+        tray_thread.start()
+
     running = True
-    while running:
+    while running and tray_globals['running']:
         dt = min(clock.tick(60) / 1000.0, 0.05)
 
         # On Windows, GetCursorPos works even when WS_EX_TRANSPARENT is set
@@ -744,6 +887,7 @@ def main():
         hornet.update(dt, screen_w)
 
         # Music: stop if sitting ended (e.g. dragged away); loop active segment
+        global music_active, music_seg, music_tick, music_dur_ms
         if music_active and not hornet.sitting:
             stop_needoline()
         elif music_active:
@@ -758,6 +902,9 @@ def main():
             draw_x, draw_y = hornet.draw_pos()
             # Move the small window to follow the sprite (SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE)
             ctypes.windll.user32.SetWindowPos(hwnd, 0, draw_x, draw_y, 0, 0, 0x0015)
+            # Maintain topmost state every frame
+            if tray_globals['topmost']:
+                ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0013)
             screen.fill(CHROMA_KEY)
             screen.blit(hornet.display_frame(), (0, 0))
         elif ARGB_MODE and offscreen:
