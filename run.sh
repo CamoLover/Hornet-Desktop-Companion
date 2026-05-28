@@ -15,7 +15,7 @@ echo "Installing requirements..."
 pip install -q --upgrade pip
 pip install -q -r requirements.txt
 
-SPRITES=(hornet_idle.png hornet_slow_fall.png hornet_fast_fall.png hornet_fast_fall_wrong.png hornet_sit_0.png)
+SPRITES=(assets/sprites/idle/hornet_idle.png assets/sprites/fast_fall/hornet_fast_fall.png assets/sprites/fast_fall/hornet_fast_fall_wrong.png assets/sprites/sit/hornet_sit_0.png)
 NEED_EXTRACT=0
 if [ "$1" = "--force" ]; then
     NEED_EXTRACT=1

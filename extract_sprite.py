@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 from scipy.ndimage import label
 
-ATLAS       = "atlas1 #34863.png"
+ATLAS       = "assets/atlas/atlas1 #34863.png"
 PAD         = 8
 CHROMA_KEY  = (0, 0, 255)   # bright blue — absent from all Hornet sprites
 ALPHA_THRESH = 100           # pixels below this alpha become chroma background
@@ -29,16 +29,16 @@ REF_SCALE = TARGET_H / REF_H   # ≈ 0.638 — applied to all sprites
 # Rotation applied BEFORE scaling.  All heights derived from REF_SCALE so
 # Hornet appears the same physical size in every sprite.
 SPRITES = [
-    (50,  "hornet_idle.png",            0,  False),
-    (383, "hornet_fast_fall_wrong.png", 0,  False),   # horizontal already
-    (98,  "hornet_fast_fall.png",      90,  False),   # horizontal rush → CCW → dive
+    (50,  "assets/sprites/idle/hornet_idle.png",            0,  False),
+    (383, "assets/sprites/fast_fall/hornet_fast_fall_wrong.png", 0,  False),   # horizontal already
+    (98,  "assets/sprites/fast_fall/hornet_fast_fall.png",      90,  False),   # horizontal rush → CCW → dive
 ]
 
 # Sitting animation — blobs in row-by-row atlas order.
 # All 219×96 in atlas; after CCW-90° rotation → 96×219 → scale by REF_SCALE.
 SIT_BLOBS    = [213, 215, 220, 224, 225, 226, 231]
 SIT_ROTATION = 90    # CCW
-SIT_PREFIX   = "hornet_sit_{}.png"
+SIT_PREFIX   = "assets/sprites/sit/hornet_sit_{}.png"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -138,7 +138,7 @@ def main():
     print(f"  {len(blobs)} qualifying blobs.")
 
     if args.debug:
-        save_debug(img, blobs, "debug_blobs.png")
+        save_debug(img, blobs, "assets/atlas/debug_blobs_1.png")
 
     # ── Fall / idle sprites ───────────────────────────────────────────────────
     for blob_idx, out_file, rot, flip in SPRITES:

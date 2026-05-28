@@ -120,7 +120,7 @@ import numpy as np
 
 CHROMA_KEY = (0, 0, 255)   # must match extract_sprite.py
 
-MUSIC_FILE = "needoline.mp3"
+MUSIC_FILE = "assets/audio/needoline.mp3"
 # (start_seconds, end_seconds) for each segment
 NEEDOLINE_SEGMENTS = [
     (  0,  46),   # default melody
@@ -264,19 +264,19 @@ def _win_click_through(hwnd, enable: bool):
 def load_raw_assets():
     """Load sprite images without convert() — safe to call before set_mode."""
     required = {
-        'IDLE':            'hornet_idle.png',
-        'FAST_FALL':       'hornet_fast_fall.png',
-        'FAST_FALL_WRONG': 'hornet_fast_fall_wrong.png',
+        'IDLE':            'assets/sprites/idle/hornet_idle.png',
+        'FAST_FALL':       'assets/sprites/fast_fall/hornet_fast_fall.png',
+        'FAST_FALL_WRONG': 'assets/sprites/fast_fall/hornet_fast_fall_wrong.png',
     }
     missing = [f for f in required.values() if not os.path.exists(f)]
-    if not os.path.exists('hornet_sit_0.png'):
-        missing.append('hornet_sit_0.png')
+    if not os.path.exists('assets/sprites/sit/hornet_sit_0.png'):
+        missing.append('assets/sprites/sit/hornet_sit_0.png')
     if missing:
         print('Missing sprites:', missing)
         print('Run:  python extract_sprite.py')
         sys.exit(1)
     raw_sprites    = {k: pygame.image.load(v) for k, v in required.items()}
-    raw_sit_frames = [pygame.image.load(f) for f in sorted(glob.glob('hornet_sit_*.png'))]
+    raw_sit_frames = [pygame.image.load(f) for f in sorted(glob.glob('assets/sprites/sit/hornet_sit_*.png'))]
     return raw_sprites, raw_sit_frames
 
 
@@ -299,7 +299,7 @@ FAST_FALL_VY  = 550.0
 WRONG_MIX     = 0.65
 DRAG_PIXELS   = 6       # pixels moved before a click becomes a drag
 ON_GROUND_TOL = 8
-SIT_Y_OFFSET  = 0.25   # fraction of idle_h to shift sit sprite down (crouching effect)
+SIT_Y_OFFSET  = 0.20   # fraction of idle_h to shift sit sprite down (crouching effect)
 
 
 class Hornet:
