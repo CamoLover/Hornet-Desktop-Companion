@@ -6,13 +6,13 @@
 
 ## Features
 
-- **Physics simulation**-  gravity, bounce damping, and friction
-- **Velocity-reactive sprites**-  four states: idle, slow fall, fast fall, and tumbling fall
-- **Sitting animation**-  multi-frame sit cycle when she lands and comes to rest
-- **Music**-  plays randomized segments of *Needoline* while sitting; stops when thrown
-- **Click-through**-  the window is invisible to mouse clicks when not hovering (Windows)
-- **Pixel-perfect transparency**-  no black box; uses the SHAPE extension on Linux or layered windows on Windows
-- **Throwable**-  drag and release with momentum to fling her
+- **Physics simulation** - gravity, bounce damping, and friction
+- **Velocity-reactive sprites** - four states: idle, slow fall, fast fall, and tumbling fall
+- **Sitting animation** - multi-frame sit cycle when she lands and comes to rest
+- **Music** - plays randomized segments of *Needoline* while sitting; stops when thrown
+- **Click-through** - the window is invisible to mouse clicks when not hovering (Windows)
+- **Pixel-perfect transparency** - no black box; uses the SHAPE extension on Linux or layered windows on Windows
+- **Throwable** - drag and release with momentum to fling her
 
 ---
 
@@ -63,7 +63,7 @@ The script creates a `.venv`, installs dependencies, extracts sprites from the a
 |---|---|
 | **Idle** | Slow or stationary / on the ground |
 | **fall** | Falling gently |
-| **Sitting** | Landed and at rest-  7-frame animation |
+| **Sitting** | Landed and at rest - 7-frame animation |
 
 ---
 
@@ -71,7 +71,7 @@ The script creates a `.venv`, installs dependencies, extracts sprites from the a
 
 | File | Purpose |
 |---|---|
-| `companion.py` | Main app-  physics, rendering, platform integration |
+| `companion.py` | Main app - physics, rendering, platform integration |
 | `extract_sprite.py` | Extracts sprites from the atlas on first run |
 | `run.sh` / `run.bat` | One-shot launcher scripts |
 | `requirements.txt` | Python dependencies |
@@ -83,9 +83,9 @@ The script creates a `.venv`, installs dependencies, extracts sprites from the a
 
 ## Tuning
 
-**Sprite rotations**-  edit the `SPRITES` list in `extract_sprite.py`. Each entry is `(blob_idx, filename, rotation_degrees_CCW, flip_h)`. Re-extract with `python extract_sprite.py --force`.
+**Sprite rotations** - edit the `SPRITES` list in `extract_sprite.py`. Each entry is `(blob_idx, filename, rotation_degrees_CCW, flip_h)`. Re-extract with `python extract_sprite.py --force`.
 
-**Physics**-  edit these constants at the top of `companion.py`:
+**Physics** - edit these constants at the top of `companion.py`:
 
 | Constant | Default | Effect |
 |---|---|---|
@@ -110,7 +110,7 @@ The script creates a `.venv`, installs dependencies, extracts sprites from the a
 - `run.bat` uses `pythonw` to suppress the console window.
 
 ### macOS
-- pygame transparency is unreliable on macOS-  the window may show a black background.
+- pygame transparency is unreliable on macOS - the window may show a black background.
 - Functional but not fully tested; Windows and Linux are better supported.
 
 ---
@@ -120,7 +120,7 @@ The script creates a `.venv`, installs dependencies, extracts sprites from the a
 Pull requests are welcome. A few things to keep in mind:
 
 - Keep the dependency list minimal (`pygame`, `Pillow`, `scipy`, `numpy`)
-- Platform-specific code lives in clearly marked sections-  keep it that way
+- Platform-specific code lives in clearly marked sections - keep it that way
 - Test on at least one platform before submitting
 
 ---

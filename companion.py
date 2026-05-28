@@ -243,13 +243,52 @@ class X11ShapeManager:
 # Windows helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+_win32_topmost_proc = None  # module-level ref keeps ctypes callback alive
+
 def _win_setup(hwnd):
     u = ctypes.windll.user32
-    u.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0003)
+    # hWndInsertAfter must be pointer-sized; without argtypes ctypes defaults to 32-bit
+    # which truncates HWND_TOPMOST (-1) to 0xFFFFFFFF — an invalid handle on 64-bit Windows
+    u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t,
+                                ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, ctypes.c_uint]
     s = u.GetWindowLongW(hwnd, -20)
     u.SetWindowLongW(hwnd, -20, s | 0x00080000)
     # COLORREF format is 0x00BBGGRR; pure blue (0,0,255) = 0x00FF0000
     u.SetLayeredWindowAttributes(hwnd, 0x00FF0000, 0, 0x1)
+    u.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0013)  # -1 = HWND_TOPMOST (64-bit)
+
+def _win_install_topmost_hook(hwnd):
+    """Subclass the WndProc to intercept WM_WINDOWPOSCHANGING and force SWP_NOZORDER,
+    preventing SDL2 from removing our always-on-top z-order on focus loss."""
+    global _win32_topmost_proc
+    u = ctypes.windll.user32
+
+    class _WP(ctypes.Structure):
+        _fields_ = [('hwnd', ctypes.c_void_p), ('after', ctypes.c_void_p),
+                    ('x', ctypes.c_int), ('y', ctypes.c_int),
+                    ('cx', ctypes.c_int), ('cy', ctypes.c_int),
+                    ('flags', ctypes.c_uint)]
+
+    PROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, ctypes.c_void_p,
+                               ctypes.c_uint, ctypes.c_longlong, ctypes.c_longlong)
+    u.GetWindowLongPtrW.restype  = ctypes.c_longlong
+    u.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    u.SetWindowLongPtrW.restype  = ctypes.c_longlong
+    u.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, PROC]
+    u.CallWindowProcW.restype    = ctypes.c_longlong
+    u.CallWindowProcW.argtypes   = [ctypes.c_longlong, ctypes.c_void_p,
+                                     ctypes.c_uint, ctypes.c_longlong, ctypes.c_longlong]
+    old = u.GetWindowLongPtrW(hwnd, -4)  # GWLP_WNDPROC
+
+    def _proc(h, msg, wp, lp):
+        if msg == 0x0046:  # WM_WINDOWPOSCHANGING
+            pos = ctypes.cast(ctypes.c_void_p(lp), ctypes.POINTER(_WP)).contents
+            pos.flags |= 0x0004  # SWP_NOZORDER: lock z-order, keeps HWND_TOPMOST
+        return u.CallWindowProcW(old, h, msg, wp, lp)
+
+    _win32_topmost_proc = PROC(_proc)
+    u.SetWindowLongPtrW(hwnd, -4, _win32_topmost_proc)
 
 def _win_click_through(hwnd, enable: bool):
     u = ctypes.windll.user32
@@ -519,6 +558,8 @@ def main():
     else:
         screen = pygame.display.set_mode((screen_w, screen_h), pygame.NOFRAME)
     pygame.display.set_caption('Hornet')
+    if hasattr(pygame.display, "set_window_always_on_top"):
+        pygame.display.set_window_always_on_top(True)
 
     # Platform setup ----------------------------------------------------------
     hwnd        = None
@@ -528,6 +569,7 @@ def main():
     if PLAT == 'Windows':
         hwnd = pygame.display.get_wm_info()['window']
         _win_setup(hwnd)
+        _win_install_topmost_hook(hwnd)
         _win_click_through(hwnd, True)
         # Pre-fill with chroma key so the window is invisible before first draw
         screen.fill(CHROMA_KEY)
