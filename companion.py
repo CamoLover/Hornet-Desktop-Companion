@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-companion.py — Hornet desktop companion.
+companion.py-  Hornet desktop companion.
 ESC to quit.  Left-click drag to throw.  Click on ground to sit / stand.
 """
 import os, sys, math, glob, platform, ctypes, ctypes.util, subprocess, re, random
@@ -12,10 +12,10 @@ PLAT = platform.system()
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _xrandr_screen_size():
-    """Total virtual desktop size from xrandr — ignores DPI scaling."""
+    """Total virtual desktop size from xrandr-  ignores DPI scaling."""
     try:
         out = subprocess.check_output(['xrandr'], text=True, stderr=subprocess.DEVNULL)
-        # "Screen 0: minimum 8 x 8, current 1920 x 1080, maximum ..." — full desktop
+        # "Screen 0: minimum 8 x 8, current 1920 x 1080, maximum ..."-  full desktop
         m = re.search(r'\bcurrent (\d+) x (\d+)', out)
         if m:
             return int(m.group(1)), int(m.group(2))
@@ -262,7 +262,7 @@ def _win_click_through(hwnd, enable: bool):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_raw_assets():
-    """Load sprite images without convert() — safe to call before set_mode."""
+    """Load sprite images without convert()-  safe to call before set_mode."""
     required = {
         'IDLE':            'assets/sprites/idle/hornet_idle.png',
         'FAST_FALL':       'assets/sprites/fast_fall/hornet_fast_fall.png',
@@ -537,7 +537,7 @@ def main():
         wm  = pygame.display.get_wm_info()
         wid = wm.get('window', 0)
         if wid:
-            # Always-on-top (once, via subprocess — tools may not be installed)
+            # Always-on-top (once, via subprocess-  tools may not be installed)
             try:
                 subprocess.run(['xprop', '-id', str(wid), '-f', '_NET_WM_STATE', '32a',
                                '-set', '_NET_WM_STATE', '_NET_WM_STATE_ABOVE'],

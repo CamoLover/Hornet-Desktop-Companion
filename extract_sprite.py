@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-extract_sprite.py — extract Hornet sprites from atlas1.
+extract_sprite.py-  extract Hornet sprites from atlas1.
 Usage:
     python extract_sprite.py           # extract (skips if files exist)
     python extract_sprite.py --force   # re-extract
@@ -14,7 +14,7 @@ from scipy.ndimage import label
 
 ATLAS       = "assets/atlas/atlas1 #34863.png"
 PAD         = 8
-CHROMA_KEY  = (0, 0, 255)   # bright blue — absent from all Hornet sprites
+CHROMA_KEY  = (0, 0, 255)   # bright blue-  absent from all Hornet sprites
 ALPHA_THRESH = 100           # pixels below this alpha become chroma background
 
 # Reference scale derived from idle sprite (blob 50) so all sprites are
@@ -22,7 +22,7 @@ ALPHA_THRESH = 100           # pixels below this alpha become chroma background
 # blob 50 crop = 200x235 (with pad) → scale to 150px tall → factor = 0.6383
 REF_H    = 235   # idle crop height (with padding)
 TARGET_H = 150   # idle display height
-REF_SCALE = TARGET_H / REF_H   # ≈ 0.638 — applied to all sprites
+REF_SCALE = TARGET_H / REF_H   # ≈ 0.638-  applied to all sprites
 
 # ── Sprite table ─────────────────────────────────────────────────────────────
 # (blob_index, output_file, rotation_CCW_deg, flip_h)
@@ -34,7 +34,7 @@ SPRITES = [
     (98,  "assets/sprites/fast_fall/hornet_fast_fall.png",      90,  False),   # horizontal rush → CCW → dive
 ]
 
-# Sitting animation — blobs in row-by-row atlas order.
+# Sitting animation-  blobs in row-by-row atlas order.
 # All 219×96 in atlas; after CCW-90° rotation → 96×219 → scale by REF_SCALE.
 SIT_BLOBS    = [213, 215, 220, 224, 225, 226, 231]
 SIT_ROTATION = 90    # CCW
