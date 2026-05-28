@@ -121,6 +121,17 @@ import numpy as np
 CHROMA_KEY = (0, 0, 255)   # must match extract_sprite.py
 
 MUSIC_FILE = "assets/audio/needoline.mp3"
+ICON_FILES = [
+    'assets/logo/logo-hdc.png',
+    'assets/logo/logo-hdc.ico',
+]
+APP_USER_MODEL_ID = 'HornetDesktopCompanion'
+ICON_IMAGE = 1
+ICON_SMALL = 0
+ICON_BIG = 1
+LR_LOADFROMFILE = 0x00000010
+LR_DEFAULTSIZE = 0x00000040
+WM_SETICON = 0x0080
 # (start_seconds, end_seconds) for each segment
 NEEDOLINE_SEGMENTS = [
     (  0,  46),   # default melody
@@ -330,6 +341,47 @@ def convert_assets(raw_sprites, raw_sit_frames):
     return sprites, sit_frames
 
 
+def load_app_icon():
+    for path in ICON_FILES:
+        if os.path.exists(path):
+            try:
+                icon = pygame.image.load(path)
+                return icon.convert_alpha() if icon.get_alpha() else icon.convert()
+            except Exception:
+                pass
+    return None
+
+
+def set_windows_app_id():
+    try:
+        shell32 = ctypes.windll.shell32
+        shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [ctypes.c_wchar_p]
+        shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.HRESULT
+        shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
+
+
+def set_windows_app_icon(hwnd):
+    ico_path = next((os.path.abspath(p) for p in ICON_FILES
+                     if p.lower().endswith('.ico') and os.path.exists(p)), None)
+    if not ico_path:
+        return
+    try:
+        user32 = ctypes.windll.user32
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        hicon = user32.LoadImageW(None, ico_path, ICON_IMAGE, 0, 0,
+                                 LR_LOADFROMFILE | LR_DEFAULTSIZE)
+        if not hicon:
+            return
+        user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
+        user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon)
+    except Exception:
+        pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Hornet entity
 # ─────────────────────────────────────────────────────────────────────────────
@@ -535,6 +587,8 @@ def render_argb(screen, offscreen, hornet):
 def main():
     pygame.mixer.pre_init(44100, -16, 2, 2048)
     pygame.init()
+    if PLAT == 'Windows':
+        set_windows_app_id()
 
     # Screen dimensions -------------------------------------------------------
     if SCREEN_W:
@@ -558,6 +612,9 @@ def main():
     else:
         screen = pygame.display.set_mode((screen_w, screen_h), pygame.NOFRAME)
     pygame.display.set_caption('Hornet')
+    icon_surf = load_app_icon()
+    if icon_surf is not None:
+        pygame.display.set_icon(icon_surf)
     if hasattr(pygame.display, "set_window_always_on_top"):
         pygame.display.set_window_always_on_top(True)
 
@@ -571,6 +628,7 @@ def main():
         _win_setup(hwnd)
         _win_install_topmost_hook(hwnd)
         _win_click_through(hwnd, True)
+        set_windows_app_icon(hwnd)
         # Pre-fill with chroma key so the window is invisible before first draw
         screen.fill(CHROMA_KEY)
         pygame.display.flip()
