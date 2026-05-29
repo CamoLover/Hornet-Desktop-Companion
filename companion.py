@@ -1252,6 +1252,10 @@ def main():
         elif music_active:
             elapsed = pygame.time.get_ticks() - music_tick
             if elapsed >= music_dur_ms:
+                if tray_globals['auto_random_song']:
+                    candidates = [i for i in range(len(NEEDOLINE_SEGMENTS)) if i != music_seg]
+                    music_seg = random.choice(candidates) if candidates else music_seg
+                    music_dur_ms = (NEEDOLINE_SEGMENTS[music_seg][1] - NEEDOLINE_SEGMENTS[music_seg][0]) * 1000
                 start_s, _ = NEEDOLINE_SEGMENTS[music_seg]
                 pygame.mixer.music.play(start=float(start_s))
                 music_tick = pygame.time.get_ticks()
