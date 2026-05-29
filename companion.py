@@ -3,11 +3,63 @@
 companion.py-  Hornet desktop companion.
 ESC to quit.  Left-click drag to throw.  Click on ground to sit / stand.
 """
+import sys as _sys
+# Expose system dist-packages so gi (GTK3) is reachable from the venv.
+# Required on Ubuntu where python3-gi is a system package, not a pip package.
+_sysdir = '/usr/lib/python3/dist-packages'
+if _sysdir not in _sys.path:
+    _sys.path.insert(0, _sysdir)
+
 import os, sys, math, glob, platform, ctypes, ctypes.util, subprocess, re, random, threading
 from PIL import Image
 from io import BytesIO
 
 PLAT = platform.system()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session environment recovery (Linux)
+# When launched outside a full login shell (desktop launchers, nohup, etc.)
+# XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS and PULSE_SERVER are often absent.
+# We scan /proc to borrow these vars from a running session process.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _restore_session_env():
+    if PLAT != 'Linux':
+        return
+    _want = ('DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR',
+             'PULSE_SERVER', 'PIPEWIRE_REMOTE')
+    if all(k in os.environ for k in _want[:2]):   # already complete
+        return
+    uid = os.getuid()
+    try:
+        for env_path in glob.glob('/proc/*/environ'):
+            try:
+                if os.stat(env_path).st_uid != uid:
+                    continue
+                with open(env_path, 'rb') as f:
+                    data = f.read()
+                proc_env = {}
+                for item in data.split(b'\x00'):
+                    if b'=' in item:
+                        k, v = item.split(b'=', 1)
+                        try:
+                            proc_env[k.decode()] = v.decode()
+                        except Exception:
+                            pass
+                # Only use processes that are actually in a D-Bus session
+                if 'DBUS_SESSION_BUS_ADDRESS' not in proc_env:
+                    continue
+                for key in _want:
+                    if key not in os.environ and key in proc_env:
+                        os.environ[key] = proc_env[key]
+                if all(k in os.environ for k in _want[:2]):
+                    return
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+_restore_session_env()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Linux pre-init: get PHYSICAL screen size and ARGB visual BEFORE pygame
@@ -42,6 +94,58 @@ def _workarea_linux():
     except Exception:
         pass
     return None
+
+
+def _linux_set_above(wid: int):
+    """Send _NET_WM_STATE ClientMessage to add ABOVE (proper EWMH protocol for mapped windows)."""
+    try:
+        lib = ctypes.CDLL(ctypes.util.find_library('X11'))
+        lib.XOpenDisplay.restype  = ctypes.c_void_p
+        lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        lib.XCloseDisplay.restype = ctypes.c_int
+        lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        lib.XInternAtom.restype   = ctypes.c_ulong
+        lib.XInternAtom.argtypes  = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        lib.XDefaultRootWindow.restype  = ctypes.c_ulong
+        lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        lib.XFlush.restype  = ctypes.c_int
+        lib.XFlush.argtypes = [ctypes.c_void_p]
+        lib.XSendEvent.restype  = ctypes.c_int
+        lib.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                    ctypes.c_int, ctypes.c_long, ctypes.c_void_p]
+        dpy = lib.XOpenDisplay(None)
+        if not dpy:
+            return
+        root        = lib.XDefaultRootWindow(dpy)
+        wm_state    = lib.XInternAtom(dpy, b'_NET_WM_STATE', False)
+        state_above = lib.XInternAtom(dpy, b'_NET_WM_STATE_ABOVE', False)
+
+        class _Data(ctypes.Union):
+            _fields_ = [('b', ctypes.c_char*20), ('s', ctypes.c_short*10),
+                        ('l', ctypes.c_long*5)]
+        class _CML(ctypes.Structure):
+            _fields_ = [('type', ctypes.c_int), ('serial', ctypes.c_ulong),
+                        ('send_event', ctypes.c_int), ('display', ctypes.c_void_p),
+                        ('window', ctypes.c_ulong), ('message_type', ctypes.c_ulong),
+                        ('format', ctypes.c_int), ('data', _Data)]
+        class _XEvt(ctypes.Union):
+            _fields_ = [('xclient', _CML), ('pad', ctypes.c_long*24)]
+
+        ev = _XEvt()
+        ev.xclient.type         = 33          # ClientMessage
+        ev.xclient.window       = wid
+        ev.xclient.message_type = wm_state
+        ev.xclient.format       = 32
+        ev.xclient.data.l[0]    = 1           # _NET_WM_STATE_ADD
+        ev.xclient.data.l[1]    = state_above
+        ev.xclient.data.l[2]    = 0
+        ev.xclient.data.l[3]    = 1           # source: application
+        mask = 0x00020000 | 0x00080000        # SubstructureRedirect | SubstructureNotify
+        lib.XSendEvent(dpy, root, False, mask, ctypes.byref(ev))
+        lib.XFlush(dpy)
+        lib.XCloseDisplay(dpy)
+    except Exception:
+        pass
 
 
 def _find_argb_visual():
@@ -370,11 +474,13 @@ def convert_assets(raw_sprites, raw_sit_frames):
     return sprites, sit_frames
 
 
-def load_app_icon():
+def load_app_icon(pre_display=False):
     for path in ICON_FILES:
         if os.path.exists(path):
             try:
                 icon = pygame.image.load(path)
+                if pre_display:
+                    return icon  # no convert() — display mode not set yet
                 return icon.convert_alpha() if icon.get_alpha() else icon.convert()
             except Exception:
                 pass
@@ -415,11 +521,12 @@ def set_windows_app_icon(hwnd):
 # Hornet entity
 # ─────────────────────────────────────────────────────────────────────────────
 
-FAST_FALL_VY  = 550.0
+FAST_FALL_VY  = 300.0
 WRONG_MIX     = 0.65
 DRAG_PIXELS   = 6       # pixels moved before a click becomes a drag
 ON_GROUND_TOL = 8
-SIT_Y_OFFSET  = 0.20   # fraction of idle_h to shift sit sprite down (crouching effect)
+SIT_Y_OFFSET  = 0.235   # fraction of idle_h to shift sit sprite down (crouching effect)
+IDLE_Y_OFFSET = -0.075   # fraction of idle_h to compensate for transparent bottom padding in idle sprite
 
 
 class Hornet:
@@ -427,7 +534,7 @@ class Hornet:
     BOUNCE_DAMP   = 0.45
     FRICTION      = 0.88
     MIN_BOUNCE_VY = 80.0
-    SIT_FPS       = 0.15
+    SIT_FPS       = 0.1
 
     def __init__(self, x, y, sprites, sit_frames, floor_y):
         self.x = float(x);  self.y = float(y)
@@ -567,6 +674,9 @@ class Hornet:
     def _sit_offset(self):
         return int(self._idle_h * SIT_Y_OFFSET) if self.sitting else 0
 
+    def _idle_y_offset(self):
+        return -int(self._idle_h * IDLE_Y_OFFSET) if not self.sitting else 0
+
     def _sit_x_offset(self, frame: pygame.Surface) -> int:
         return (self._idle_w - frame.get_width()) // 2 if self.sitting else 0
 
@@ -582,7 +692,7 @@ class Hornet:
     def draw(self, surface):
         frame = self.display_frame()
         draw_x = int(self.x) + self._sit_x_offset(frame)
-        draw_y = int(self.y) + self._idle_h - frame.get_height() + self._sit_offset()
+        draw_y = int(self.y) + self._idle_h - frame.get_height() + self._idle_y_offset() + self._sit_offset()
         surface.blit(frame, (draw_x, draw_y))
 
     def shape_key(self):
@@ -595,7 +705,7 @@ class Hornet:
         """Top-left (x, y) of the current frame as drawn."""
         frame = self.display_frame()
         draw_x = int(self.x) + self._sit_x_offset(frame)
-        draw_y = int(self.y) + self._idle_h - frame.get_height() + self._sit_offset()
+        draw_y = int(self.y) + self._idle_h - frame.get_height() + self._idle_y_offset() + self._sit_offset()
         return draw_x, draw_y
 
 
@@ -615,81 +725,312 @@ def render_argb(screen, offscreen, hornet):
 
 def _create_tray_icon(hwnd, hornet_ref):
     """Create and run the system tray icon (blocking, run in separate thread)."""
+    if PLAT == 'Linux':
+        _create_tray_icon_sni(hornet_ref)
+        return
+
+    # ── Windows: pystray ──────────────────────────────────────────────────────
     try:
         from pystray import Icon, Menu, MenuItem
     except ImportError:
         print("pystray not installed, tray icon disabled")
         return
 
+    _icon_ref = [None]
+
     def on_song(song_idx):
-        """Handler for selecting a specific song (song_idx >= 0) or random (-1)."""
-        def handler(icon, item):
-            if song_idx == -1:  # Random
+        def handler(icon=None, item=None):
+            if song_idx == -1:
                 tray_globals['auto_random_song'] = True
                 tray_globals['current_song'] = -1
             else:
                 tray_globals['current_song'] = song_idx
                 tray_globals['auto_random_song'] = False
-            # If hornet is sitting, play immediately
             if hornet_ref[0] and hornet_ref[0].sitting:
                 start_song_from_tray(song_idx if song_idx >= 0 else random.randrange(len(NEEDOLINE_SEGMENTS)))
-            icon.update_menu()
         return handler
 
     def on_volume(vol):
-        def handler(icon, item):
+        def handler(icon=None, item=None):
             tray_globals['volume'] = vol
             pygame.mixer.music.set_volume(vol)
         return handler
 
-    def on_quit(icon, item):
+    def on_quit(icon=None, item=None):
         tray_globals['running'] = False
-        icon.stop()
+        ic = icon if icon is not None else _icon_ref[0]
+        if ic:
+            ic.stop()
 
-    # Build volume submenu
-    volume_items = [
-        MenuItem(f'{int(v*100)}%', on_volume(v))
-        for v in [0.0, 0.25, 0.5, 0.75, 1.0]
-    ]
+    volume_items = [MenuItem(f'{int(v*100)}%', on_volume(v)) for v in [0.0,0.25,0.5,0.75,1.0]]
+    song_items   = [MenuItem('Random', on_song(-1))] + [MenuItem(SONG_NAMES[i], on_song(i)) for i in range(len(SONG_NAMES))]
 
-    # Create song submenu - include Random as first option
-    song_items = [
-        MenuItem('Random', on_song(-1)),  # -1 means random
-    ]
-    song_items.extend([
-        MenuItem(SONG_NAMES[i], on_song(i))
-        for i in range(len(SONG_NAMES))
-    ])
-
-    # Build the main menu dynamically
     def build_menu():
-        return Menu(
-            MenuItem('Songs', Menu(*song_items)),
-            MenuItem('Volume', Menu(*volume_items)),
-            MenuItem('Quit', on_quit),
-        )
+        return Menu(MenuItem('Songs', Menu(*song_items)), MenuItem('Volume', Menu(*volume_items)), MenuItem('Quit', on_quit))
 
-    # Create minimal icon image (small hornet)
     try:
         icon_img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
-        # Try to use the app icon if available
         for path in ICON_FILES:
             if os.path.exists(path) and not path.endswith('.ico'):
                 try:
                     img = Image.open(path).convert('RGBA')
                     img.thumbnail((64, 64))
                     icon_img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
-                    offset = ((64 - img.width) // 2, (64 - img.height) // 2)
-                    icon_img.paste(img, offset, img)
+                    icon_img.paste(img, ((64-img.width)//2, (64-img.height)//2), img)
                     break
                 except Exception:
                     pass
     except Exception:
-        # Fallback: create a simple blue square
         icon_img = Image.new('RGBA', (64, 64), (0, 0, 255, 255))
 
-    icon = Icon('HornetCompanion', icon_img, menu=build_menu())
-    icon.run()
+    try:
+        icon = Icon('HornetCompanion', icon_img, menu=build_menu())
+        _icon_ref[0] = icon
+        icon.run()
+    except Exception as e:
+        print(f"Tray icon failed: {e}")
+
+
+def _create_tray_icon_sni(hornet_ref):
+    """
+    Linux tray icon via StatusNotifierItem (SNI) over D-Bus.
+    Works on Ubuntu GNOME with any AppIndicator-compatible extension.
+    Requires system python3-gi (gi) and python3-dbus (dbus) — both already
+    available via /usr/lib/python3/dist-packages which is in sys.path.
+    Menu is shown as a tkinter popup (no GTK/AppIndicator3 package needed).
+    """
+    import struct
+
+    if 'DBUS_SESSION_BUS_ADDRESS' not in os.environ:
+        print("[tray] DBUS_SESSION_BUS_ADDRESS not set — tray disabled")
+        return
+
+    try:
+        import dbus
+        import dbus.service
+        from dbus.mainloop.glib import DBusGMainLoop
+        import gi
+        gi.require_version('GLib', '2.0')
+        from gi.repository import GLib
+    except ImportError as e:
+        print(f"[tray] SNI unavailable ({e}), tray disabled")
+        return
+
+    _sni_ref = [None]
+
+    # ── Callbacks ──────────────────────────────────────────────────────────────
+    def on_song_cb(idx):
+        def cb():
+            if idx == -1:
+                tray_globals['auto_random_song'] = True
+                tray_globals['current_song'] = -1
+            else:
+                tray_globals['current_song'] = idx
+                tray_globals['auto_random_song'] = False
+            if hornet_ref[0] and hornet_ref[0].sitting:
+                start_song_from_tray(idx if idx >= 0 else random.randrange(len(NEEDOLINE_SEGMENTS)))
+        return cb
+
+    def on_vol_cb(vol):
+        def cb():
+            tray_globals['volume'] = vol
+            pygame.mixer.music.set_volume(vol)
+        return cb
+
+    def on_quit_cb():
+        tray_globals['running'] = False
+        if _sni_ref[0]:
+            _sni_ref[0].stop()
+
+    # ── Tkinter popup menu ─────────────────────────────────────────────────────
+    def show_menu(x, y):
+        def _run():
+            try:
+                import tkinter as tk
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes('-topmost', True)
+
+                def close_run(cb):
+                    def inner():
+                        root.after(50, root.destroy)
+                        try: cb()
+                        except Exception: pass
+                    return inner
+
+                pop = tk.Menu(root, tearoff=0)
+
+                sm = tk.Menu(pop, tearoff=0)
+                sm.add_command(label='Random', command=close_run(on_song_cb(-1)))
+                for i, n in enumerate(SONG_NAMES):
+                    sm.add_command(label=n, command=close_run(on_song_cb(i)))
+                pop.add_cascade(label='Songs', menu=sm)
+
+                vm = tk.Menu(pop, tearoff=0)
+                for v in [0.0, 0.25, 0.5, 0.75, 1.0]:
+                    vm.add_command(label=f'{int(v*100)}%', command=close_run(on_vol_cb(v)))
+                pop.add_cascade(label='Volume', menu=vm)
+
+                pop.add_separator()
+                pop.add_command(label='Quit', command=close_run(on_quit_cb))
+                pop.bind('<Unmap>', lambda e: root.after(150, root.destroy))
+                root.after(0, lambda: pop.tk_popup(x, y, 0))
+                root.mainloop()
+            except Exception as e:
+                print(f"[tray] menu error: {e}")
+        threading.Thread(target=_run, daemon=True).start()
+
+    # ── Icon pixmap (SNI ARGB32 big-endian format) ─────────────────────────────
+    def build_pixmap(size=22):
+        for path in ICON_FILES:
+            if os.path.exists(path) and not path.endswith('.ico'):
+                try:
+                    img = Image.open(path).convert('RGBA').resize((size, size), Image.LANCZOS)
+                    raw = bytearray()
+                    for r, g, b, a in img.getdata():
+                        raw += struct.pack('>I', (a << 24) | (r << 16) | (g << 8) | b)
+                    return dbus.Array(
+                        [dbus.Struct(
+                            (dbus.Int32(size), dbus.Int32(size),
+                             dbus.Array(list(raw), signature='y')),
+                            signature='iiay')],
+                        signature='(iiay)')
+                except Exception as e:
+                    print(f"[tray] pixmap error: {e}")
+        return dbus.Array([], signature='(iiay)')
+
+    # ── StatusNotifierItem D-Bus service ───────────────────────────────────────
+    SNI = 'org.kde.StatusNotifierItem'
+
+    class HornetSNI(dbus.service.Object):
+        def __init__(self):
+            DBusGMainLoop(set_as_default=True)
+
+            # D-Bus session bus rejects root. If we're root but the session
+            # belongs to another user, temporarily drop effective uid for the
+            # connection handshake only (D-Bus authenticates at connect time).
+            _saved_euid = os.geteuid()
+            _drop_uid   = None
+            if _saved_euid == 0:
+                bus_addr = os.environ.get('DBUS_SESSION_BUS_ADDRESS', '')
+                sock = ''
+                for part in bus_addr.split(','):
+                    if part.startswith('unix:path='):
+                        sock = part[len('unix:path='):]
+                    elif part.startswith('path='):
+                        sock = part[len('path='):]
+                if sock:
+                    try:
+                        _drop_uid = os.stat(sock).st_uid
+                        if _drop_uid and _drop_uid != 0:
+                            os.seteuid(_drop_uid)
+                    except Exception:
+                        _drop_uid = None
+
+            try:
+                bus = dbus.SessionBus()
+            finally:
+                if _drop_uid:
+                    os.seteuid(_saved_euid)   # restore root after handshake
+
+            svc_name = f'org.kde.StatusNotifierItem-{os.getpid()}-1'
+            bn       = dbus.service.BusName(svc_name, bus)
+            super().__init__(bn, '/StatusNotifierItem')
+            self._loop   = GLib.MainLoop()
+            self._pixmap = build_pixmap()
+
+            for watcher in ('org.kde.StatusNotifierWatcher',
+                            'com.canonical.StatusNotifierWatcher'):
+                try:
+                    dbus.Interface(
+                        bus.get_object(watcher, '/StatusNotifierWatcher'),
+                        watcher
+                    ).RegisterStatusNotifierItem(svc_name)
+                    print(f"[tray] registered with {watcher}")
+                    break
+                except Exception:
+                    pass
+
+        def run(self):
+            GLib.timeout_add(500, lambda: tray_globals['running'] or
+                             (self._loop.quit() or False))
+            self._loop.run()
+
+        def stop(self):
+            self._loop.quit()
+
+        # SNI action methods
+        @dbus.service.method(SNI, in_signature='ii')
+        def Activate(self, x, y):           show_menu(x, y)
+
+        @dbus.service.method(SNI, in_signature='ii')
+        def SecondaryActivate(self, x, y):  show_menu(x, y)
+
+        @dbus.service.method(SNI, in_signature='ii')
+        def ContextMenu(self, x, y):        show_menu(x, y)
+
+        @dbus.service.method(SNI, in_signature='is')
+        def Scroll(self, delta, orientation): pass
+
+        # Properties
+        @dbus.service.method('org.freedesktop.DBus.Properties',
+                             in_signature='ss', out_signature='v')
+        def Get(self, iface, prop):
+            return self.GetAll(iface).get(prop, dbus.String(''))
+
+        @dbus.service.method('org.freedesktop.DBus.Properties',
+                             in_signature='s', out_signature='a{sv}')
+        def GetAll(self, iface):
+            empty = dbus.Array([], signature='(iiay)')
+            return {
+                'Id':                  dbus.String('HornetCompanion'),
+                'Category':            dbus.String('ApplicationStatus'),
+                'Status':              dbus.String('Active'),
+                'Title':               dbus.String('Hornet Desktop Companion'),
+                'IconName':            dbus.String(''),
+                'IconPixmap':          self._pixmap,
+                'AttentionIconName':   dbus.String(''),
+                'AttentionIconPixmap': empty,
+                'OverlayIconName':     dbus.String(''),
+                'OverlayIconPixmap':   empty,
+                'ToolTip':             dbus.Struct(
+                    ('', dbus.Array([], signature='(iiay)'), 'Hornet', ''),
+                    signature='sa(iiay)ss'),
+                'ItemIsMenu':          dbus.Boolean(False),
+            }
+
+        @dbus.service.method('org.freedesktop.DBus.Properties', in_signature='ssv')
+        def Set(self, iface, prop, val): pass
+
+        @dbus.service.signal('org.freedesktop.DBus.Properties', signature='sa{sv}as')
+        def PropertiesChanged(self, iface, changed, invalidated): pass
+
+        @dbus.service.signal(SNI)
+        def NewIcon(self): pass
+
+        @dbus.service.signal(SNI)
+        def NewTitle(self): pass
+
+        @dbus.service.signal(SNI, signature='s')
+        def NewStatus(self, status): pass
+
+        @dbus.service.signal(SNI)
+        def NewAttentionIcon(self): pass
+
+        @dbus.service.signal(SNI)
+        def NewOverlayIcon(self): pass
+
+        @dbus.service.signal(SNI)
+        def NewToolTip(self): pass
+
+    try:
+        sni = HornetSNI()
+        _sni_ref[0] = sni
+        sni.run()
+    except Exception as e:
+        import traceback
+        print(f"[tray] SNI error: {e}")
+        traceback.print_exc()
 
 
 def start_song_from_tray(song_idx):
@@ -717,6 +1058,22 @@ def start_song_from_tray(song_idx):
 def main():
     pygame.mixer.pre_init(44100, -16, 2, 2048)
     pygame.init()
+    # SDL may fail to open the default audio device on PipeWire/PulseAudio systems.
+    # Retry with explicit drivers until one works.
+    if not pygame.mixer.get_init():
+        for _drv in ['pipewire', 'pulse', 'alsa', 'jack']:
+            os.environ['SDL_AUDIODRIVER'] = _drv
+            pygame.mixer.quit()
+            try:
+                pygame.mixer.init(44100, -16, 2, 2048)
+                if pygame.mixer.get_init():
+                    print(f"[music] audio OK with SDL_AUDIODRIVER={_drv}")
+                    break
+            except Exception as _e:
+                print(f"[music] {_drv} failed: {_e}")
+        else:
+            print("[music] all audio drivers failed — music disabled")
+    print(f"[music] mixer init: {pygame.mixer.get_init()}")
     if PLAT == 'Windows':
         set_windows_app_id()
 
@@ -735,6 +1092,11 @@ def main():
     win_w   = max(s.get_width()  for s in all_raw)
     win_h   = max(s.get_height() for s in all_raw)
 
+    # Set icon before set_mode so X11/SDL picks it up at window creation time
+    icon_surf_raw = load_app_icon(pre_display=True)
+    if icon_surf_raw is not None:
+        pygame.display.set_icon(icon_surf_raw)
+
     # On Windows use a small sprite-sized window; tracking it is much faster
     # than compositing a full-screen layered window every frame via GDI.
     if PLAT == 'Windows':
@@ -742,11 +1104,10 @@ def main():
     else:
         screen = pygame.display.set_mode((screen_w, screen_h), pygame.NOFRAME)
     pygame.display.set_caption('Hornet')
+    # Re-set icon with a properly converted surface now that the display exists
     icon_surf = load_app_icon()
     if icon_surf is not None:
         pygame.display.set_icon(icon_surf)
-    if hasattr(pygame.display, "set_window_always_on_top"):
-        pygame.display.set_window_always_on_top(True)
 
     # Platform setup ----------------------------------------------------------
     hwnd        = None
@@ -767,18 +1128,16 @@ def main():
         wm  = pygame.display.get_wm_info()
         wid = wm.get('window', 0)
         if wid:
-            # Always-on-top (once, via subprocess-  tools may not be installed)
-            try:
-                subprocess.run(['xprop', '-id', str(wid), '-f', '_NET_WM_STATE', '32a',
-                               '-set', '_NET_WM_STATE', '_NET_WM_STATE_ABOVE'],
-                              capture_output=True, check=False)
-            except FileNotFoundError:
-                pass
+            # Proper EWMH ClientMessage — the only reliable way to set ABOVE on a
+            # mapped window (xprop -set writes the property directly and is ignored
+            # by the WM for windows that are already visible).
+            _linux_set_above(wid)
+            # Also try wmctrl as an additional belt-and-suspenders approach
             try:
                 subprocess.run(['wmctrl', '-i', '-r', hex(wid),
                                '-b', 'add,above,skip_taskbar'],
-                              capture_output=True, check=False)
-            except FileNotFoundError:
+                              capture_output=True, check=False, timeout=2)
+            except (FileNotFoundError, subprocess.TimeoutExpired):
                 pass
 
             if not ARGB_MODE:
@@ -826,8 +1185,8 @@ def main():
             pygame.mixer.music.play(start=float(start_s))
             music_tick   = pygame.time.get_ticks()
             music_active = True
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[music] playback error: {e}")
 
     def stop_needoline():
         global music_active
@@ -838,7 +1197,7 @@ def main():
     # ── Tray icon (Windows only) ──────────────────────────────────────────────
     hornet_ref = [hornet]  # Mutable reference for tray thread
     tray_thread = None
-    if PLAT == 'Windows':
+    if PLAT in ('Windows', 'Linux'):
         tray_thread = threading.Thread(
             target=_create_tray_icon,
             args=(hwnd, hornet_ref),
@@ -928,4 +1287,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
