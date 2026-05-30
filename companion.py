@@ -268,6 +268,7 @@ tray_globals = {
     'volume': 1.0,
     'current_song': -1,
     'auto_random_song': True,  # If False, always use current_song when sitting
+    'hwnd': None,
 }
 
 # Global music state (modified by both main loop and tray)
@@ -974,11 +975,18 @@ def _create_tray_icon(hwnd, hornet_ref):
     def on_reload_config(icon=None, item=None):
         load_config(apply_volume=True)
 
+    def on_reset_topmost(icon=None, item=None):
+        h = tray_globals.get('hwnd')
+        if h:
+            # Cycle NOTOPMOST → TOPMOST to unstick z-order
+            ctypes.windll.user32.SetWindowPos(h, 1,  0, 0, 0, 0, 0x0013)  # HWND_NOTOPMOST
+            ctypes.windll.user32.SetWindowPos(h, -1, 0, 0, 0, 0, 0x0013)  # HWND_TOPMOST
+
     volume_items = [MenuItem(f'{int(v*100)}%', on_volume(v)) for v in [0.0,0.25,0.5,0.75,1.0]]
     song_items   = [MenuItem('Random', on_song(-1))] + [MenuItem(SONG_NAMES[i], on_song(i)) for i in range(len(SONG_NAMES))]
 
     def build_menu():
-        return Menu(MenuItem('Songs', Menu(*song_items)), MenuItem('Volume', Menu(*volume_items)), MenuItem('Reload Config', on_reload_config), MenuItem('Quit', on_quit))
+        return Menu(MenuItem('Songs', Menu(*song_items)), MenuItem('Volume', Menu(*volume_items)), MenuItem('Reload Config', on_reload_config), MenuItem('Reset Topmost', on_reset_topmost), MenuItem('Quit', on_quit))
 
     try:
         icon_img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
@@ -1335,6 +1343,7 @@ def main():
 
     if PLAT == 'Windows':
         hwnd = pygame.display.get_wm_info()['window']
+        tray_globals['hwnd'] = hwnd
         _win_setup(hwnd)
         _win_install_topmost_hook(hwnd)
         _win_click_through(hwnd, True)
@@ -1499,6 +1508,7 @@ def main():
                 new_h = max(s.get_height() for s in all_scaled)
                 screen = pygame.display.set_mode((new_w, new_h), pygame.NOFRAME)
                 hwnd = pygame.display.get_wm_info()['window']
+                tray_globals['hwnd'] = hwnd
                 _win_setup(hwnd)
                 screen.fill(CHROMA_KEY)
                 pygame.display.flip()
