@@ -10,7 +10,7 @@ _sysdir = '/usr/lib/python3/dist-packages'
 if _sysdir not in _sys.path:
     _sys.path.insert(0, _sysdir)
 
-import os, sys, math, glob, platform, ctypes, ctypes.util, subprocess, re, random, threading
+import os, sys, math, glob, platform, ctypes, ctypes.util, subprocess, re, random, threading, json
 from PIL import Image
 from io import BytesIO
 
@@ -231,6 +231,7 @@ ICON_FILES = [
     'assets/logo/logo-hdc.png',
     'assets/logo/logo-hdc.ico',
 ]
+CONFIG_PATH = 'config.json'
 APP_USER_MODEL_ID = 'HornetDesktopCompanion'
 ICON_IMAGE = 1
 ICON_SMALL = 0
@@ -521,12 +522,13 @@ def set_windows_app_icon(hwnd):
 # Hornet entity
 # ─────────────────────────────────────────────────────────────────────────────
 
+DRAG_PIXELS   = 6       # pixels moved before a click becomes a drag
+# Physics/offset constants below are set by load_config() at startup from config.json
 FAST_FALL_VY  = 300.0
 WRONG_MIX     = 0.65
-DRAG_PIXELS   = 6       # pixels moved before a click becomes a drag
 ON_GROUND_TOL = 8
-SIT_Y_OFFSET  = 0.235   # fraction of idle_h to shift sit sprite down (crouching effect)
-IDLE_Y_OFFSET = -0.075   # fraction of idle_h to compensate for transparent bottom padding in idle sprite
+SIT_Y_OFFSET  = 0.235
+IDLE_Y_OFFSET = -0.075
 
 
 class Hornet:
@@ -710,6 +712,61 @@ class Hornet:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CONFIG_DEFAULTS = {
+    'gravity':       1800.0,
+    'bounce_damp':   0.45,
+    'friction':      0.88,
+    'min_bounce_vy': 80.0,
+    'sit_fps':       0.1,
+    'fast_fall_vy':  300.0,
+    'wrong_mix':     0.65,
+    'on_ground_tol': 8,
+    'sit_y_offset':  0.235,
+    'idle_y_offset': -0.075,
+    'volume':        1.0,
+}
+
+def load_config(apply_volume=False):
+    global FAST_FALL_VY, WRONG_MIX, ON_GROUND_TOL, SIT_Y_OFFSET, IDLE_Y_OFFSET
+    cfg = dict(_CONFIG_DEFAULTS)
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                user = json.load(f)
+            cfg.update({k: v for k, v in user.items() if k in _CONFIG_DEFAULTS})
+        except Exception as e:
+            print(f"[config] failed to load {CONFIG_PATH}: {e}")
+    else:
+        try:
+            with open(CONFIG_PATH, 'w') as f:
+                json.dump(_CONFIG_DEFAULTS, f, indent=4)
+            print(f"[config] created default {CONFIG_PATH}")
+        except Exception as e:
+            print(f"[config] failed to write default {CONFIG_PATH}: {e}")
+
+    Hornet.GRAVITY       = float(cfg['gravity'])
+    Hornet.BOUNCE_DAMP   = float(cfg['bounce_damp'])
+    Hornet.FRICTION      = float(cfg['friction'])
+    Hornet.MIN_BOUNCE_VY = float(cfg['min_bounce_vy'])
+    Hornet.SIT_FPS       = float(cfg['sit_fps'])
+    FAST_FALL_VY  = float(cfg['fast_fall_vy'])
+    WRONG_MIX     = float(cfg['wrong_mix'])
+    ON_GROUND_TOL = int(cfg['on_ground_tol'])
+    SIT_Y_OFFSET  = float(cfg['sit_y_offset'])
+    IDLE_Y_OFFSET = float(cfg['idle_y_offset'])
+    tray_globals['volume'] = float(cfg['volume'])
+    if apply_volume:
+        try:
+            pygame.mixer.music.set_volume(tray_globals['volume'])
+        except Exception:
+            pass
+    print(f"[config] loaded — gravity={Hornet.GRAVITY}, bounce={Hornet.BOUNCE_DAMP}, volume={tray_globals['volume']}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ARGB render helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -762,11 +819,14 @@ def _create_tray_icon(hwnd, hornet_ref):
         if ic:
             ic.stop()
 
+    def on_reload_config(icon=None, item=None):
+        load_config(apply_volume=True)
+
     volume_items = [MenuItem(f'{int(v*100)}%', on_volume(v)) for v in [0.0,0.25,0.5,0.75,1.0]]
     song_items   = [MenuItem('Random', on_song(-1))] + [MenuItem(SONG_NAMES[i], on_song(i)) for i in range(len(SONG_NAMES))]
 
     def build_menu():
-        return Menu(MenuItem('Songs', Menu(*song_items)), MenuItem('Volume', Menu(*volume_items)), MenuItem('Quit', on_quit))
+        return Menu(MenuItem('Songs', Menu(*song_items)), MenuItem('Volume', Menu(*volume_items)), MenuItem('Reload Config', on_reload_config), MenuItem('Quit', on_quit))
 
     try:
         icon_img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
@@ -842,6 +902,9 @@ def _create_tray_icon_sni(hornet_ref):
         if _sni_ref[0]:
             _sni_ref[0].stop()
 
+    def on_reload_config_cb():
+        load_config(apply_volume=True)
+
     # ── Tkinter popup menu ─────────────────────────────────────────────────────
     def show_menu(x, y):
         def _run():
@@ -872,6 +935,7 @@ def _create_tray_icon_sni(hornet_ref):
                 pop.add_cascade(label='Volume', menu=vm)
 
                 pop.add_separator()
+                pop.add_command(label='Reload Config', command=close_run(on_reload_config_cb))
                 pop.add_command(label='Quit', command=close_run(on_quit_cb))
                 pop.bind('<Unmap>', lambda e: root.after(150, root.destroy))
                 root.after(0, lambda: pop.tk_popup(x, y, 0))
@@ -1056,6 +1120,7 @@ def start_song_from_tray(song_idx):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    load_config()
     pygame.mixer.pre_init(44100, -16, 2, 2048)
     pygame.init()
     # SDL may fail to open the default audio device on PipeWire/PulseAudio systems.

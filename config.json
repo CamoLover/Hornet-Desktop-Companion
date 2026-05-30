@@ -1,0 +1,13 @@
+{
+    "gravity": 1800.0,
+    "bounce_damp": 0.45,
+    "friction": 0.88,
+    "min_bounce_vy": 80.0,
+    "sit_fps": 0.1,
+    "fast_fall_vy": 300.0,
+    "wrong_mix": 0.65,
+    "on_ground_tol": 8,
+    "sit_y_offset": 0.235,
+    "idle_y_offset": -0.075,
+    "volume": 1.0
+}
