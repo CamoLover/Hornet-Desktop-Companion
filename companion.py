@@ -16,6 +16,19 @@ from io import BytesIO
 
 PLAT = platform.system()
 
+def _resource(rel):
+    """Resolve a bundled asset path (handles PyInstaller --onefile and normal runs)."""
+    if getattr(sys, 'frozen', False):
+        base = sys._MEIPASS if hasattr(sys, '_MEIPASS') else os.path.dirname(sys.executable)
+        return os.path.join(base, rel)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
+
+def _user_data(filename):
+    """Resolve a user-editable file next to the exe (stays writable outside the bundle)."""
+    if getattr(sys, 'frozen', False):
+        return os.path.join(os.path.dirname(sys.executable), filename)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Session environment recovery (Linux)
 # When launched outside a full login shell (desktop launchers, nohup, etc.)
@@ -226,12 +239,12 @@ import numpy as np
 
 CHROMA_KEY = (0, 0, 255)   # Win32 layered-window color key (blue screen fill → transparent)
 
-MUSIC_FILE = "assets/audio/needoline.mp3"
+MUSIC_FILE = _resource("assets/audio/needoline.mp3")
 ICON_FILES = [
-    'assets/logo/logo-hdc.png',
-    'assets/logo/logo-hdc.ico',
+    _resource('assets/logo/logo-hdc.png'),
+    _resource('assets/logo/logo-hdc.ico'),
 ]
-CONFIG_PATH = 'config.json'
+CONFIG_PATH = _user_data('config.json')
 APP_USER_MODEL_ID = 'HornetDesktopCompanion'
 ICON_IMAGE = 1
 ICON_SMALL = 0
@@ -455,16 +468,16 @@ def _num_sorted(pattern):
 def load_raw_assets():
     """Load sprite images without convert() -  safe to call before set_mode."""
     seqs = {
-        'idle':      _num_sorted('assets/sprites/idle/hornet_idle_*.png'),
-        'sit_down':  _num_sorted('assets/sprites/sit_down/sit_*.png'),
-        'sit_intro': _num_sorted('assets/sprites/sit_intro/sit_play_*.png'),
-        'sit_loop':  _num_sorted('assets/sprites/sit_loop/hornet_sit_play_*.png'),
-        'sit_outro': _num_sorted('assets/sprites/sit_outro/sit_end_*.png'),
-        'sit_up':    _num_sorted('assets/sprites/sit_up/sit_get_up_*.png'),
+        'idle':      _num_sorted(_resource('assets/sprites/idle/hornet_idle_*.png')),
+        'sit_down':  _num_sorted(_resource('assets/sprites/sit_down/sit_*.png')),
+        'sit_intro': _num_sorted(_resource('assets/sprites/sit_intro/sit_play_*.png')),
+        'sit_loop':  _num_sorted(_resource('assets/sprites/sit_loop/hornet_sit_play_*.png')),
+        'sit_outro': _num_sorted(_resource('assets/sprites/sit_outro/sit_end_*.png')),
+        'sit_up':    _num_sorted(_resource('assets/sprites/sit_up/sit_get_up_*.png')),
     }
     singles = {
-        'FAST_FALL':       'assets/sprites/fast_fall/hornet_fast_fall.png',
-        'FAST_FALL_WRONG': 'assets/sprites/fast_fall/hornet_fast_fall_wrong.png',
+        'FAST_FALL':       _resource('assets/sprites/fast_fall/hornet_fast_fall.png'),
+        'FAST_FALL_WRONG': _resource('assets/sprites/fast_fall/hornet_fast_fall_wrong.png'),
     }
     missing = [p for p in singles.values() if not os.path.exists(p)]
     missing += [f'assets/sprites/{k}/' for k, v in seqs.items() if not v]

@@ -1,0 +1,41 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build EXE
+        run: pyinstaller hornet-companion.spec
+
+      - name: Prepare release folder
+        run: |
+          mkdir release
+          copy dist\HornetDesktopCompanion.exe release\
+          copy config.json release\
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HornetDesktopCompanion-windows-${{ github.sha }}
+          path: release\
+          retention-days: 30
