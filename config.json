@@ -4,10 +4,13 @@
     "friction": 0.88,
     "min_bounce_vy": 80.0,
     "sit_fps": 0.1,
+    "idle_fps": 0.1,
+    "sit_pause_dur": 0.025,
     "fast_fall_vy": 300.0,
     "wrong_mix": 0.65,
     "on_ground_tol": 8,
-    "sit_y_offset": 0.235,
-    "idle_y_offset": -0.075,
-    "volume": 1.0
+    "sit_y_offset": 0.23,
+    "idle_y_offset": -0.025,
+    "volume": 1.0,
+    "scale": 75
 }

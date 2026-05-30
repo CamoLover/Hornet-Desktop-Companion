@@ -224,7 +224,7 @@ os.environ.setdefault('SDL_VIDEO_WINDOW_POS', '0,0')
 import pygame
 import numpy as np
 
-CHROMA_KEY = (0, 0, 255)   # must match extract_sprite.py
+CHROMA_KEY = (0, 0, 255)   # Win32 layered-window color key (blue screen fill → transparent)
 
 MUSIC_FILE = "assets/audio/needoline.mp3"
 ICON_FILES = [
@@ -393,7 +393,7 @@ _win32_topmost_proc = None  # module-level ref keeps ctypes callback alive
 def _win_setup(hwnd):
     u = ctypes.windll.user32
     # hWndInsertAfter must be pointer-sized; without argtypes ctypes defaults to 32-bit
-    # which truncates HWND_TOPMOST (-1) to 0xFFFFFFFF — an invalid handle on 64-bit Windows
+    # which truncates HWND_TOPMOST (-1) to 0xFFFFFFFF -  an invalid handle on 64-bit Windows
     u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t,
                                 ctypes.c_int, ctypes.c_int,
                                 ctypes.c_int, ctypes.c_int, ctypes.c_uint]
@@ -445,34 +445,53 @@ def _win_click_through(hwnd, enable: bool):
 # Sprite loading
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _num_sorted(pattern):
+    """Glob + sort by the trailing integer in filenames (natural order)."""
+    paths = glob.glob(pattern)
+    return sorted(paths, key=lambda p: int(re.search(r'(\d+)\.[^.]+$', p).group(1)))
+
+
 def load_raw_assets():
-    """Load sprite images without convert()-  safe to call before set_mode."""
-    required = {
-        'IDLE':            'assets/sprites/idle/hornet_idle.png',
+    """Load sprite images without convert() -  safe to call before set_mode."""
+    seqs = {
+        'idle':      _num_sorted('assets/sprites/idle/hornet_idle_*.png'),
+        'sit_down':  _num_sorted('assets/sprites/sit_down/sit_*.png'),
+        'sit_intro': _num_sorted('assets/sprites/sit_intro/sit_play_*.png'),
+        'sit_loop':  _num_sorted('assets/sprites/sit_loop/hornet_sit_play_*.png'),
+        'sit_outro': _num_sorted('assets/sprites/sit_outro/sit_end_*.png'),
+        'sit_up':    _num_sorted('assets/sprites/sit_up/sit_get_up_*.png'),
+    }
+    singles = {
         'FAST_FALL':       'assets/sprites/fast_fall/hornet_fast_fall.png',
         'FAST_FALL_WRONG': 'assets/sprites/fast_fall/hornet_fast_fall_wrong.png',
     }
-    missing = [f for f in required.values() if not os.path.exists(f)]
-    if not os.path.exists('assets/sprites/sit/hornet_sit_0.png'):
-        missing.append('assets/sprites/sit/hornet_sit_0.png')
+    missing = [p for p in singles.values() if not os.path.exists(p)]
+    missing += [f'assets/sprites/{k}/' for k, v in seqs.items() if not v]
     if missing:
         print('Missing sprites:', missing)
-        print('Run:  python extract_sprite.py')
         sys.exit(1)
-    raw_sprites    = {k: pygame.image.load(v) for k, v in required.items()}
-    raw_sit_frames = [pygame.image.load(f) for f in sorted(glob.glob('assets/sprites/sit/hornet_sit_*.png'))]
-    return raw_sprites, raw_sit_frames
+    raw_sprites = {k: pygame.image.load(v) for k, v in singles.items()}
+    raw_seqs    = {k: [pygame.image.load(f) for f in v] for k, v in seqs.items()}
+    return raw_sprites, raw_seqs
 
 
-def convert_assets(raw_sprites, raw_sit_frames):
-    """Convert raw surfaces to display format and apply chroma key."""
+def convert_assets(raw_sprites, raw_seqs):
+    """Convert raw surfaces to SRCALPHA with optional scaling."""
     def _conv(s):
-        s = s.convert()
-        s.set_colorkey(CHROMA_KEY)
+        s = s.convert_alpha()
+        if SPRITE_SCALE != 1.0:
+            w = max(1, int(s.get_width()  * SPRITE_SCALE))
+            h = max(1, int(s.get_height() * SPRITE_SCALE))
+            s = pygame.transform.smoothscale(s, (w, h))
+        # Always quantize alpha: snaps semi-transparent PNG edge pixels to 0 or 255
+        # so they don't composite with the blue Win32 background and leave a visible fringe
+        alpha = pygame.surfarray.pixels_alpha(s)
+        alpha[:] = np.where(alpha < 128, 0, 255)
+        del alpha
         return s
-    sprites    = {k: _conv(v) for k, v in raw_sprites.items()}
-    sit_frames = [_conv(s) for s in raw_sit_frames]
-    return sprites, sit_frames
+    sprites = {k: _conv(v) for k, v in raw_sprites.items()}
+    seqs    = {k: [_conv(s) for s in v] for k, v in raw_seqs.items()}
+    return sprites, seqs
 
 
 def load_app_icon(pre_display=False):
@@ -481,7 +500,7 @@ def load_app_icon(pre_display=False):
             try:
                 icon = pygame.image.load(path)
                 if pre_display:
-                    return icon  # no convert() — display mode not set yet
+                    return icon  # no convert() -  display mode not set yet
                 return icon.convert_alpha() if icon.get_alpha() else icon.convert()
             except Exception:
                 pass
@@ -537,21 +556,37 @@ class Hornet:
     FRICTION      = 0.88
     MIN_BOUNCE_VY = 80.0
     SIT_FPS       = 0.1
+    IDLE_FPS      = 0.15
+    SIT_PAUSE_DUR = 0.25   # pause between sit_down→sit_intro and sit_outro→sit_up
 
-    def __init__(self, x, y, sprites, sit_frames, floor_y):
+    def __init__(self, x, y, sprites, seqs, floor_y):
         self.x = float(x);  self.y = float(y)
         self.vx = 0.0;      self.vy = 0.0
 
-        self.sprites    = sprites
-        self.sit_frames = sit_frames
-        self.floor_y    = floor_y
+        self.sprites          = sprites
+        self.idle_frames      = seqs['idle']
+        self.sit_down_frames  = seqs['sit_down']
+        self.sit_intro_frames = seqs['sit_intro']
+        self.sit_loop_frames  = seqs['sit_loop']
+        self.sit_outro_frames = seqs['sit_outro']
+        self.sit_up_frames    = seqs['sit_up']
+        self.floor_y          = floor_y
 
         self.state        = 'IDLE'
         self.facing_right = True
 
-        self.sitting   = False
+        self.idle_idx   = 0
+        self.idle_timer = 0.0
+
+        # sit_phase: None|'sit_down'|'sit_pause_pre'|'sit_intro'|
+        #            'sit_loop'|'sit_outro'|'sit_pause_post'|'sit_up'
+        self.sit_phase = None
         self.sit_idx   = 0
         self.sit_timer = 0.0
+
+        # Single-frame events consumed by main()
+        self.ev_music_start = False
+        self.ev_music_stop  = False
 
         self._pending  = False
         self._pend_mx  = 0;  self._pend_my  = 0
@@ -562,13 +597,31 @@ class Hornet:
 
     # ── helpers ───────────────────────────────────────────────────────────────
     @property
-    def _idle_w(self): return self.sprites['IDLE'].get_width()
+    def sitting(self):
+        return self.sit_phase is not None
+
     @property
-    def _idle_h(self): return self.sprites['IDLE'].get_height()
+    def _idle_w(self): return self.idle_frames[0].get_width()
+    @property
+    def _idle_h(self): return self.idle_frames[0].get_height()
 
     def current_frame(self) -> pygame.Surface:
-        if self.sitting and self.sit_frames:
-            return self.sit_frames[self.sit_idx]
+        if self.sit_phase == 'sit_down':
+            return self.sit_down_frames[self.sit_idx]
+        if self.sit_phase == 'sit_pause_pre':
+            return self.sit_down_frames[-1]
+        if self.sit_phase == 'sit_intro':
+            return self.sit_intro_frames[self.sit_idx]
+        if self.sit_phase == 'sit_loop':
+            return self.sit_loop_frames[self.sit_idx]
+        if self.sit_phase == 'sit_outro':
+            return self.sit_outro_frames[self.sit_idx]
+        if self.sit_phase == 'sit_pause_post':
+            return self.sit_outro_frames[-1]
+        if self.sit_phase == 'sit_up':
+            return self.sit_up_frames[self.sit_idx]
+        if self.state == 'IDLE':
+            return self.idle_frames[self.idle_idx]
         return self.sprites[self.state]
 
     def is_clicked(self, mx, my) -> bool:
@@ -592,7 +645,7 @@ class Hornet:
             if math.hypot(mx - self._pend_mx, my - self._pend_my) >= DRAG_PIXELS:
                 self._pending = False
                 if self.sitting:
-                    self.sitting = False
+                    self._cancel_sit_drag()
                 self._start_drag(self._pend_mx, self._pend_my)
                 self._upd_drag(mx, my, dt)
         elif self.dragging:
@@ -601,14 +654,28 @@ class Hornet:
     def mouse_up(self, mx, my):
         if self._pending:
             self._pending = False
-            if self.sitting:
-                self.sitting = False
+            if self.sit_phase == 'sit_loop':
+                # Graceful exit: play the outro sequence
+                self.sit_phase = 'sit_outro'
+                self.sit_idx   = 0
+                self.sit_timer = 0.0
+                self.ev_music_stop = True
+            elif self.sit_phase is not None:
+                pass  # Ignore clicks during transition animations
             elif self.is_on_ground():
-                self.sitting   = True
+                self.sit_phase = 'sit_down'
                 self.sit_idx   = 0
                 self.sit_timer = 0.0
         elif self.dragging:
             self._end_drag()
+
+    def _cancel_sit_drag(self):
+        """Immediately cancel all sit phases when dragged away."""
+        if self.sit_phase in ('sit_loop', 'sit_outro'):
+            self.ev_music_stop = True
+        self.sit_phase = None
+        self.sit_idx   = 0
+        self.sit_timer = 0.0
 
     def _start_drag(self, mx, my):
         self.dragging = True
@@ -642,14 +709,76 @@ class Hornet:
         else:
             self.state = 'IDLE'
 
-    # ── physics ───────────────────────────────────────────────────────────────
-    def update(self, dt, screen_w):
-        if self.sitting:
+    # ── sit state machine ─────────────────────────────────────────────────────
+    def _update_sit(self, dt):
+        p = self.sit_phase
+
+        if p == 'sit_down':
             self.sit_timer += dt
             if self.sit_timer >= self.SIT_FPS:
                 self.sit_timer = 0.0
-                self.sit_idx = (self.sit_idx + 1) % max(1, len(self.sit_frames))
+                self.sit_idx += 1
+                if self.sit_idx >= len(self.sit_down_frames):
+                    self.sit_phase = 'sit_pause_pre'
+                    self.sit_timer = 0.0
+
+        elif p == 'sit_pause_pre':
+            self.sit_timer += dt
+            if self.sit_timer >= self.SIT_PAUSE_DUR:
+                self.sit_phase = 'sit_intro'
+                self.sit_idx   = 0
+                self.sit_timer = 0.0
+
+        elif p == 'sit_intro':
+            self.sit_timer += dt
+            if self.sit_timer >= self.SIT_FPS:
+                self.sit_timer = 0.0
+                self.sit_idx += 1
+                if self.sit_idx >= len(self.sit_intro_frames):
+                    self.sit_phase      = 'sit_loop'
+                    self.sit_idx        = 0
+                    self.sit_timer      = 0.0
+                    self.ev_music_start = True
+
+        elif p == 'sit_loop':
+            self.sit_timer += dt
+            if self.sit_timer >= self.SIT_FPS:
+                self.sit_timer = 0.0
+                self.sit_idx = (self.sit_idx + 1) % len(self.sit_loop_frames)
+
+        elif p == 'sit_outro':
+            self.sit_timer += dt
+            if self.sit_timer >= self.SIT_FPS:
+                self.sit_timer = 0.0
+                self.sit_idx += 1
+                if self.sit_idx >= len(self.sit_outro_frames):
+                    self.sit_phase = 'sit_pause_post'
+                    self.sit_timer = 0.0
+
+        elif p == 'sit_pause_post':
+            self.sit_timer += dt
+            if self.sit_timer >= self.SIT_PAUSE_DUR:
+                self.sit_phase = 'sit_up'
+                self.sit_idx   = 0
+                self.sit_timer = 0.0
+
+        elif p == 'sit_up':
+            self.sit_timer += dt
+            if self.sit_timer >= self.SIT_FPS:
+                self.sit_timer = 0.0
+                self.sit_idx += 1
+                if self.sit_idx >= len(self.sit_up_frames):
+                    self.sit_phase = None  # done -  back to idle
+
+    # ── physics ───────────────────────────────────────────────────────────────
+    def update(self, dt, screen_w):
+        if self.sitting:
+            self._update_sit(dt)
             return
+        self.idle_timer += dt
+        if self.idle_timer >= self.IDLE_FPS:
+            self.idle_timer = 0.0
+            self.idle_idx = (self.idle_idx + 1) % len(self.idle_frames)
         if self.dragging:
             self._upd_state(); return
         if abs(self.vx) > 30:
@@ -674,7 +803,13 @@ class Hornet:
 
     # ── draw ──────────────────────────────────────────────────────────────────
     def _sit_offset(self):
-        return int(self._idle_h * SIT_Y_OFFSET) if self.sitting else 0
+        if not self.sitting:
+            return 0
+        base = int(self._idle_h * SIT_Y_OFFSET)
+        if self.sit_phase == 'sit_up' and len(self.sit_up_frames) > 1:
+            t = self.sit_idx / (len(self.sit_up_frames) - 1)
+            return int(base * (1.0 - t))
+        return base
 
     def _idle_y_offset(self):
         return -int(self._idle_h * IDLE_Y_OFFSET) if not self.sitting else 0
@@ -685,9 +820,7 @@ class Hornet:
     def display_frame(self) -> pygame.Surface:
         """Current frame as it will actually be rendered (h-flip applied)."""
         frame = self.current_frame()
-        # Sitting sprites are naturally mirrored vs movement sprites in the atlas
-        should_flip = self.facing_right if self.sitting else not self.facing_right
-        if should_flip:
+        if not self.facing_right:
             frame = pygame.transform.flip(frame, True, False)
         return frame
 
@@ -699,8 +832,10 @@ class Hornet:
 
     def shape_key(self):
         """Hashable cache key for the current visible frame."""
-        if self.sitting:
-            return ('sit', self.sit_idx, self.facing_right)
+        if self.sit_phase:
+            return ('sit', self.sit_phase, self.sit_idx, self.facing_right)
+        if self.state == 'IDLE':
+            return ('idle', self.idle_idx, self.facing_right)
         return (self.state, self.facing_right)
 
     def draw_pos(self):
@@ -721,16 +856,24 @@ _CONFIG_DEFAULTS = {
     'friction':      0.88,
     'min_bounce_vy': 80.0,
     'sit_fps':       0.1,
+    'idle_fps':      0.15,
+    'sit_pause_dur': 0.25,
     'fast_fall_vy':  300.0,
     'wrong_mix':     0.65,
     'on_ground_tol': 8,
     'sit_y_offset':  0.235,
     'idle_y_offset': -0.075,
     'volume':        1.0,
+    'scale':         100,
 }
 
+SPRITE_SCALE     = 1.0    # set by load_config()
+_raw_sprites     = None   # stored after load_raw_assets() so runtime rescale can re-convert
+_raw_seqs        = None
+_pending_rescale = False  # set True by load_config() when scale changes at runtime
+
 def load_config(apply_volume=False):
-    global FAST_FALL_VY, WRONG_MIX, ON_GROUND_TOL, SIT_Y_OFFSET, IDLE_Y_OFFSET
+    global FAST_FALL_VY, WRONG_MIX, ON_GROUND_TOL, SIT_Y_OFFSET, IDLE_Y_OFFSET, SPRITE_SCALE, _pending_rescale
     cfg = dict(_CONFIG_DEFAULTS)
     if os.path.exists(CONFIG_PATH):
         try:
@@ -752,6 +895,12 @@ def load_config(apply_volume=False):
     Hornet.FRICTION      = float(cfg['friction'])
     Hornet.MIN_BOUNCE_VY = float(cfg['min_bounce_vy'])
     Hornet.SIT_FPS       = float(cfg['sit_fps'])
+    Hornet.IDLE_FPS      = float(cfg['idle_fps'])
+    Hornet.SIT_PAUSE_DUR = float(cfg['sit_pause_dur'])
+    new_scale = max(0.1, float(cfg['scale']) / 100.0)
+    if apply_volume and abs(new_scale - SPRITE_SCALE) > 1e-6:
+        _pending_rescale = True
+    SPRITE_SCALE = new_scale
     FAST_FALL_VY  = float(cfg['fast_fall_vy'])
     WRONG_MIX     = float(cfg['wrong_mix'])
     ON_GROUND_TOL = int(cfg['on_ground_tol'])
@@ -763,7 +912,10 @@ def load_config(apply_volume=False):
             pygame.mixer.music.set_volume(tray_globals['volume'])
         except Exception:
             pass
-    print(f"[config] loaded — gravity={Hornet.GRAVITY}, bounce={Hornet.BOUNCE_DAMP}, volume={tray_globals['volume']}")
+    print(f"[config] loaded -  gravity={Hornet.GRAVITY} bounce={Hornet.BOUNCE_DAMP} "
+          f"sit_fps={Hornet.SIT_FPS} idle_fps={Hornet.IDLE_FPS} sit_pause={Hornet.SIT_PAUSE_DUR}s "
+          f"volume={tray_globals['volume']} scale={SPRITE_SCALE*100:.0f}%"
+          + (" (rescaling sprites)" if _pending_rescale else ""))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -855,14 +1007,14 @@ def _create_tray_icon_sni(hornet_ref):
     """
     Linux tray icon via StatusNotifierItem (SNI) over D-Bus.
     Works on Ubuntu GNOME with any AppIndicator-compatible extension.
-    Requires system python3-gi (gi) and python3-dbus (dbus) — both already
+    Requires system python3-gi (gi) and python3-dbus (dbus) -  both already
     available via /usr/lib/python3/dist-packages which is in sys.path.
     Menu is shown as a tkinter popup (no GTK/AppIndicator3 package needed).
     """
     import struct
 
     if 'DBUS_SESSION_BUS_ADDRESS' not in os.environ:
-        print("[tray] DBUS_SESSION_BUS_ADDRESS not set — tray disabled")
+        print("[tray] DBUS_SESSION_BUS_ADDRESS not set -  tray disabled")
         return
 
     try:
@@ -1137,7 +1289,7 @@ def main():
             except Exception as _e:
                 print(f"[music] {_drv} failed: {_e}")
         else:
-            print("[music] all audio drivers failed — music disabled")
+            print("[music] all audio drivers failed -  music disabled")
     print(f"[music] mixer init: {pygame.mixer.get_init()}")
     if PLAT == 'Windows':
         set_windows_app_id()
@@ -1152,10 +1304,12 @@ def main():
     usable_h = USABLE_H if USABLE_H else screen_h
 
     # Load raw sprites before set_mode so we know sizes for the Windows window
-    raw_sprites, raw_sit_frames = load_raw_assets()
-    all_raw = list(raw_sprites.values()) + raw_sit_frames
-    win_w   = max(s.get_width()  for s in all_raw)
-    win_h   = max(s.get_height() for s in all_raw)
+    global _raw_sprites, _raw_seqs
+    raw_sprites, raw_seqs = load_raw_assets()
+    _raw_sprites, _raw_seqs = raw_sprites, raw_seqs
+    all_raw = list(raw_sprites.values()) + [s for seq in raw_seqs.values() for s in seq]
+    win_w   = max(1, int(max(s.get_width()  for s in all_raw) * SPRITE_SCALE))
+    win_h   = max(1, int(max(s.get_height() for s in all_raw) * SPRITE_SCALE))
 
     # Set icon before set_mode so X11/SDL picks it up at window creation time
     icon_surf_raw = load_app_icon(pre_display=True)
@@ -1193,7 +1347,7 @@ def main():
         wm  = pygame.display.get_wm_info()
         wid = wm.get('window', 0)
         if wid:
-            # Proper EWMH ClientMessage — the only reliable way to set ABOVE on a
+            # Proper EWMH ClientMessage -  the only reliable way to set ABOVE on a
             # mapped window (xprop -set writes the property directly and is ignored
             # by the WM for windows that are already visible).
             _linux_set_above(wid)
@@ -1211,17 +1365,17 @@ def main():
                 if not shape_mgr.connect(wid):
                     shape_mgr = None
 
-    sprites, sit_frames = convert_assets(raw_sprites, raw_sit_frames)
+    sprites, seqs = convert_assets(raw_sprites, raw_seqs)
 
-    idle_h  = sprites['IDLE'].get_height()
+    idle_h  = seqs['idle'][0].get_height()
     floor_y = float(usable_h - idle_h)
 
     hornet = Hornet(
-        x          = float(screen_w//2 - sprites['IDLE'].get_width()//2),
-        y          = 50.0,
-        sprites    = sprites,
-        sit_frames = sit_frames,
-        floor_y    = floor_y,
+        x       = float(screen_w//2 - seqs['idle'][0].get_width()//2),
+        y       = 50.0,
+        sprites = sprites,
+        seqs    = seqs,
+        floor_y = floor_y,
     )
     hornet.vy = 120.0
 
@@ -1299,22 +1453,23 @@ def main():
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 hornet.mouse_down(mx, my)
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                was_sitting = hornet.sitting
                 hornet.mouse_up(mx, my)
-                if hornet.sitting and not was_sitting:
-                    start_needoline()
-                elif not hornet.sitting and was_sitting:
-                    stop_needoline()
             elif event.type == pygame.MOUSEMOTION:
                 hornet.mouse_move(mx, my, dt)
 
         hornet.update(dt, screen_w)
 
-        # Music: stop if sitting ended (e.g. dragged away); loop active segment
-        global music_active, music_seg, music_tick, music_dur_ms
-        if music_active and not hornet.sitting:
+        # Consume sit animation events
+        if hornet.ev_music_start:
+            hornet.ev_music_start = False
+            start_needoline()
+        if hornet.ev_music_stop:
+            hornet.ev_music_stop = False
             stop_needoline()
-        elif music_active:
+
+        # Music: loop active segment
+        global music_active, music_seg, music_tick, music_dur_ms
+        if music_active:
             elapsed = pygame.time.get_ticks() - music_tick
             if elapsed >= music_dur_ms:
                 if tray_globals['auto_random_song']:
@@ -1324,6 +1479,29 @@ def main():
                 start_s, _ = NEEDOLINE_SEGMENTS[music_seg]
                 pygame.mixer.music.play(start=float(start_s))
                 music_tick = pygame.time.get_ticks()
+
+        # Runtime rescale: re-convert all sprites with new SPRITE_SCALE
+        global _pending_rescale
+        if _pending_rescale:
+            _pending_rescale = False
+            new_sprites, new_seqs = convert_assets(_raw_sprites, _raw_seqs)
+            hornet.sprites          = new_sprites
+            hornet.idle_frames      = new_seqs['idle']
+            hornet.sit_down_frames  = new_seqs['sit_down']
+            hornet.sit_intro_frames = new_seqs['sit_intro']
+            hornet.sit_loop_frames  = new_seqs['sit_loop']
+            hornet.sit_outro_frames = new_seqs['sit_outro']
+            hornet.sit_up_frames    = new_seqs['sit_up']
+            hornet.floor_y = float(usable_h - new_seqs['idle'][0].get_height())
+            if PLAT == 'Windows':
+                all_scaled = list(new_sprites.values()) + [s for sq in new_seqs.values() for s in sq]
+                new_w = max(s.get_width()  for s in all_scaled)
+                new_h = max(s.get_height() for s in all_scaled)
+                screen = pygame.display.set_mode((new_w, new_h), pygame.NOFRAME)
+                hwnd = pygame.display.get_wm_info()['window']
+                _win_setup(hwnd)
+                screen.fill(CHROMA_KEY)
+                pygame.display.flip()
 
         # Render
         if PLAT == 'Windows':
