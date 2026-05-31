@@ -547,7 +547,7 @@ ON_GROUND_TOL = 8
 SIT_Y_OFFSET  = 0.235
 IDLE_Y_OFFSET = -0.075
 SLEEP_Y_OFFSET = 0.12
-Z_OVERHEAD    = 70   # pixels of transparent headroom above sprite for sleeping Z particles
+Z_OVERHEAD    = 70   # headroom (px at 100% scale) above sprite for sleeping Z particles
 
 
 class ZParticle:
@@ -854,10 +854,10 @@ class Hornet:
         else:
             base_x = sw * 0.68
         base_y = sh * 0.30
-        x  = base_x + random.uniform(-6, 6)
-        y  = base_y + random.uniform(-4, 4)
-        vx = (1 if self.facing_right else -1) * random.uniform(3, 7)
-        vy = random.uniform(-16, -22)
+        x  = base_x + random.uniform(-6, 6) * SPRITE_SCALE
+        y  = base_y + random.uniform(-4, 4) * SPRITE_SCALE
+        vx = (1 if self.facing_right else -1) * random.uniform(3, 7) * SPRITE_SCALE
+        vy = random.uniform(-16, -22) * SPRITE_SCALE
         lifetime     = random.uniform(2.0, 2.8)
         wobble_phase = random.uniform(0, math.pi * 2)
         self.z_particles.append(ZParticle(x, y, vx, vy, lifetime, wobble_phase))
@@ -895,7 +895,7 @@ class Hornet:
             v = int(255 * max(0.0, 1.0 - t * 1.15))
             if v < 20:
                 continue
-            wobble_x = math.sin(p.wobble_phase + p.age * 2.8) * 4
+            wobble_x = math.sin(p.wobble_phase + p.age * 2.8) * 4 * SPRITE_SCALE
             px = int(ox + p.x + wobble_x)
             py = int(oy + p.y)
             glyph = font.render('Z', True, (v, v, v)).convert_alpha()
@@ -1528,7 +1528,7 @@ def main():
     # On Windows use a small sprite-sized window; tracking it is much faster
     # than compositing a full-screen layered window every frame via GDI.
     if PLAT == 'Windows':
-        screen = pygame.display.set_mode((win_w, win_h + Z_OVERHEAD), pygame.NOFRAME)
+        screen = pygame.display.set_mode((win_w, win_h + int(Z_OVERHEAD * SPRITE_SCALE)), pygame.NOFRAME)
     else:
         screen = pygame.display.set_mode((screen_w, screen_h), pygame.NOFRAME)
     pygame.display.set_caption('Hornet')
@@ -1694,19 +1694,26 @@ def main():
         if _pending_rescale:
             _pending_rescale = False
             new_sprites, new_seqs = convert_assets(_raw_sprites, _raw_seqs)
-            hornet.sprites          = new_sprites
-            hornet.idle_frames      = new_seqs['idle']
-            hornet.sit_down_frames  = new_seqs['sit_down']
-            hornet.sit_intro_frames = new_seqs['sit_intro']
-            hornet.sit_loop_frames  = new_seqs['sit_loop']
-            hornet.sit_outro_frames = new_seqs['sit_outro']
-            hornet.sit_up_frames    = new_seqs['sit_up']
+            hornet.sprites           = new_sprites
+            hornet.idle_frames       = new_seqs['idle']
+            hornet.sit_down_frames   = new_seqs['sit_down']
+            hornet.sit_intro_frames  = new_seqs['sit_intro']
+            hornet.sit_loop_frames   = new_seqs['sit_loop']
+            hornet.sit_outro_frames  = new_seqs['sit_outro']
+            hornet.sit_up_frames     = new_seqs['sit_up']
+            hornet.sleep_wake_frames = new_seqs['sleep_wake']
+            hornet.sleep_frame       = new_sprites['sleep']
+            old_floor_y    = hornet.floor_y
             hornet.floor_y = float(usable_h - new_seqs['idle'][0].get_height())
+            hornet.y      += hornet.floor_y - old_floor_y
+            # Stale particle positions are meaningless after a rescale
+            hornet.z_particles  = []
+            hornet.z_spawn_timer = 0.0
             if PLAT == 'Windows':
                 all_scaled = list(new_sprites.values()) + [s for sq in new_seqs.values() for s in sq]
                 new_w = max(s.get_width()  for s in all_scaled)
                 new_h = max(s.get_height() for s in all_scaled)
-                screen = pygame.display.set_mode((new_w, new_h + Z_OVERHEAD), pygame.NOFRAME)
+                screen = pygame.display.set_mode((new_w, new_h + int(Z_OVERHEAD * SPRITE_SCALE)), pygame.NOFRAME)
                 hwnd = pygame.display.get_wm_info()['window']
                 tray_globals['hwnd'] = hwnd
                 _win_setup(hwnd)
@@ -1722,7 +1729,8 @@ def main():
             # Move the small window to follow the sprite (SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE)
             # Window is positioned Z_OVERHEAD pixels above the sprite so Z particles have
             # room to float upward without being clipped.
-            u32.SetWindowPos(hwnd, 0, draw_x, draw_y - Z_OVERHEAD, 0, 0, 0x0015)
+            z_oh = int(Z_OVERHEAD * SPRITE_SCALE)
+            u32.SetWindowPos(hwnd, 0, draw_x, draw_y - z_oh, 0, 0, 0x0015)
             if tray_globals['topmost'] and u32.GetWindow(hwnd, 3):
                 # Something is above Hornet -  reassert unless a menu or capturing
                 # popup is active (GetGUIThreadInfo catches Win32 menus incl.
@@ -1733,8 +1741,8 @@ def main():
                 if not (gti.flags & _GUI_INMENUMODE) and not u32.GetCapture():
                     _win_assert_topmost(hwnd)
             screen.fill(CHROMA_KEY)
-            screen.blit(hornet.display_frame(), (0, Z_OVERHEAD))
-            hornet.draw_z_particles(screen, 0, Z_OVERHEAD)
+            screen.blit(hornet.display_frame(), (0, z_oh))
+            hornet.draw_z_particles(screen, 0, z_oh)
         elif ARGB_MODE and offscreen:
             render_argb(screen, offscreen, hornet)
         else:
