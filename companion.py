@@ -282,6 +282,7 @@ tray_globals = {
     'current_song': -1,
     'auto_random_song': True,  # If False, always use current_song when sitting
     'hwnd': None,
+    'sleep_z': True,           # Show floating Z's while sleeping
 }
 
 # Global music state (modified by both main loop and tray)
@@ -546,6 +547,17 @@ ON_GROUND_TOL = 8
 SIT_Y_OFFSET  = 0.235
 IDLE_Y_OFFSET = -0.075
 SLEEP_Y_OFFSET = 0.12
+Z_OVERHEAD    = 70   # pixels of transparent headroom above sprite for sleeping Z particles
+
+
+class ZParticle:
+    __slots__ = ('x', 'y', 'vx', 'vy', 'age', 'lifetime', 'wobble_phase')
+    def __init__(self, x, y, vx, vy, lifetime, wobble_phase):
+        self.x = x; self.y = y
+        self.vx = vx; self.vy = vy
+        self.age = 0.0
+        self.lifetime = lifetime
+        self.wobble_phase = wobble_phase
 
 
 class Hornet:
@@ -558,6 +570,9 @@ class Hornet:
     SIT_PAUSE_DUR = 0.25   # pause between sit_down→sit_intro and sit_outro→sit_up
     SLEEP_FPS     = 0.08   # seconds per frame for sleep_wake animation
     SLEEP_TIMEOUT = 300.0  # seconds of ground inactivity before falling asleep
+
+    _z_font      = None
+    _z_font_size = 0
 
     def __init__(self, x, y, sprites, seqs, floor_y):
         self.x = float(x);  self.y = float(y)
@@ -591,6 +606,8 @@ class Hornet:
         self.sleep_idx        = 0
         self.sleep_timer      = 0.0
         self.inactivity_timer = 0.0
+        self.z_particles      = []
+        self.z_spawn_timer    = 0.0
 
         # Single-frame events consumed by main()
         self.ev_music_start = False
@@ -827,6 +844,68 @@ class Hornet:
                     self.sleep_idx        = 0
                     self.inactivity_timer = 0.0
 
+        self._update_z_particles(dt)
+
+    def _spawn_z_particle(self):
+        sw = self.sleep_frame.get_width()
+        sh = self.sleep_frame.get_height()
+        if self.facing_right:
+            base_x = sw * 0.32
+        else:
+            base_x = sw * 0.68
+        base_y = sh * 0.30
+        x  = base_x + random.uniform(-6, 6)
+        y  = base_y + random.uniform(-4, 4)
+        vx = (1 if self.facing_right else -1) * random.uniform(3, 7)
+        vy = random.uniform(-16, -22)
+        lifetime     = random.uniform(2.0, 2.8)
+        wobble_phase = random.uniform(0, math.pi * 2)
+        self.z_particles.append(ZParticle(x, y, vx, vy, lifetime, wobble_phase))
+
+    def _update_z_particles(self, dt):
+        alive = []
+        for p in self.z_particles:
+            p.age += dt
+            if p.age < p.lifetime:
+                p.x += p.vx * dt
+                p.y += p.vy * dt
+                alive.append(p)
+        self.z_particles = alive
+        if tray_globals['sleep_z'] and self.sleep_phase == 'sleeping' and len(self.z_particles) < 3:
+            self.z_spawn_timer += dt
+            if self.z_spawn_timer >= 1.2:
+                self.z_spawn_timer = 0.0
+                self._spawn_z_particle()
+
+    def draw_z_particles(self, surface, ox, oy):
+        if not self.z_particles:
+            return
+        font_size = max(12, self._idle_h // 7)
+        if Hornet._z_font is None or Hornet._z_font_size != font_size:
+            Hornet._z_font      = pygame.font.SysFont(None, font_size, bold=True)
+            Hornet._z_font_size = font_size
+        font = Hornet._z_font
+        for p in self.z_particles:
+            t = p.age / p.lifetime
+            if t >= 1.0:
+                continue
+            # Fade brightness white→gray and stop drawing near the end.
+            # Using colour brightness (not set_alpha) so semi-transparent pixels
+            # never get composited against the Win32 chroma-key blue background.
+            v = int(255 * max(0.0, 1.0 - t * 1.15))
+            if v < 20:
+                continue
+            wobble_x = math.sin(p.wobble_phase + p.age * 2.8) * 4
+            px = int(ox + p.x + wobble_x)
+            py = int(oy + p.y)
+            glyph = font.render('Z', True, (v, v, v)).convert_alpha()
+            # Quantize per-pixel alpha to 0/255 — same trick as sprite loading —
+            # so no pixel partially blends with the chroma-key background.
+            arr = pygame.surfarray.pixels_alpha(glyph)
+            arr[:] = np.where(arr > 127, 255, 0)
+            del arr
+            surface.blit(glyph, (px, py))
+
     def _start_sleep(self):
         self.vx           = 0.0
         self.vy           = 0.0
@@ -834,12 +913,17 @@ class Hornet:
         self.sleep_idx    = 0
         self.sleep_timer  = 0.0
         self.inactivity_timer = 0.0
+        self.z_particles  = []
+        self.z_spawn_timer = 0.0
 
     # ── physics ───────────────────────────────────────────────────────────────
     def update(self, dt, screen_w):
         if self.sleeping:
             self._update_sleep(dt)
             return
+        # Keep ticking any Z particles still fading out after waking
+        if self.z_particles:
+            self._update_z_particles(dt)
         if self.sitting:
             self._update_sit(dt)
             return
@@ -1020,6 +1104,7 @@ def load_config(apply_volume=False):
 def render_argb(screen, offscreen, hornet):
     offscreen.fill((0, 0, 0, 0))
     hornet.draw(offscreen)
+    hornet.draw_z_particles(offscreen, *hornet.draw_pos())
     pygame.surfarray.blit_array(screen, pygame.surfarray.array2d(offscreen))
 
 
@@ -1074,11 +1159,25 @@ def _create_tray_icon(hwnd, hornet_ref):
         if h:
             _win_assert_topmost(h)
 
+    def on_toggle_sleep_z(icon=None, item=None):
+        tray_globals['sleep_z'] = not tray_globals['sleep_z']
+        if not tray_globals['sleep_z'] and hornet_ref[0]:
+            hornet_ref[0].z_particles  = []
+            hornet_ref[0].z_spawn_timer = 0.0
+
     volume_items = [MenuItem(f'{int(v*100)}%', on_volume(v)) for v in [0.0,0.25,0.5,0.75,1.0]]
     song_items   = [MenuItem('Random', on_song(-1))] + [MenuItem(SONG_NAMES[i], on_song(i)) for i in range(len(SONG_NAMES))]
 
     def build_menu():
-        return Menu(MenuItem('Songs', Menu(*song_items)), MenuItem('Volume', Menu(*volume_items)), MenuItem('Reload Config', on_reload_config), MenuItem('Reset Topmost', on_reset_topmost), MenuItem('Quit', on_quit))
+        return Menu(
+            MenuItem('Songs', Menu(*song_items)),
+            MenuItem('Volume', Menu(*volume_items)),
+            MenuItem('Sleep Z\'s', on_toggle_sleep_z,
+                     checked=lambda item: tray_globals['sleep_z']),
+            MenuItem('Reload Config', on_reload_config),
+            MenuItem('Reset Topmost', on_reset_topmost),
+            MenuItem('Quit', on_quit),
+        )
 
     try:
         icon_img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
@@ -1157,6 +1256,12 @@ def _create_tray_icon_sni(hornet_ref):
     def on_reload_config_cb():
         load_config(apply_volume=True)
 
+    def on_toggle_sleep_z_cb():
+        tray_globals['sleep_z'] = not tray_globals['sleep_z']
+        if not tray_globals['sleep_z'] and hornet_ref[0]:
+            hornet_ref[0].z_particles  = []
+            hornet_ref[0].z_spawn_timer = 0.0
+
     # ── Tkinter popup menu ─────────────────────────────────────────────────────
     def show_menu(x, y):
         def _run():
@@ -1186,6 +1291,10 @@ def _create_tray_icon_sni(hornet_ref):
                     vm.add_command(label=f'{int(v*100)}%', command=close_run(on_vol_cb(v)))
                 pop.add_cascade(label='Volume', menu=vm)
 
+                pop.add_separator()
+                sleep_z_var = tk.BooleanVar(value=tray_globals['sleep_z'])
+                pop.add_checkbutton(label="Sleep Z's", variable=sleep_z_var,
+                                    command=close_run(on_toggle_sleep_z_cb))
                 pop.add_separator()
                 pop.add_command(label='Reload Config', command=close_run(on_reload_config_cb))
                 pop.add_command(label='Quit', command=close_run(on_quit_cb))
@@ -1419,7 +1528,7 @@ def main():
     # On Windows use a small sprite-sized window; tracking it is much faster
     # than compositing a full-screen layered window every frame via GDI.
     if PLAT == 'Windows':
-        screen = pygame.display.set_mode((win_w, win_h), pygame.NOFRAME)
+        screen = pygame.display.set_mode((win_w, win_h + Z_OVERHEAD), pygame.NOFRAME)
     else:
         screen = pygame.display.set_mode((screen_w, screen_h), pygame.NOFRAME)
     pygame.display.set_caption('Hornet')
@@ -1597,7 +1706,7 @@ def main():
                 all_scaled = list(new_sprites.values()) + [s for sq in new_seqs.values() for s in sq]
                 new_w = max(s.get_width()  for s in all_scaled)
                 new_h = max(s.get_height() for s in all_scaled)
-                screen = pygame.display.set_mode((new_w, new_h), pygame.NOFRAME)
+                screen = pygame.display.set_mode((new_w, new_h + Z_OVERHEAD), pygame.NOFRAME)
                 hwnd = pygame.display.get_wm_info()['window']
                 tray_globals['hwnd'] = hwnd
                 _win_setup(hwnd)
@@ -1611,7 +1720,9 @@ def main():
             draw_x, draw_y = hornet.draw_pos()
             u32 = ctypes.windll.user32
             # Move the small window to follow the sprite (SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE)
-            u32.SetWindowPos(hwnd, 0, draw_x, draw_y, 0, 0, 0x0015)
+            # Window is positioned Z_OVERHEAD pixels above the sprite so Z particles have
+            # room to float upward without being clipped.
+            u32.SetWindowPos(hwnd, 0, draw_x, draw_y - Z_OVERHEAD, 0, 0, 0x0015)
             if tray_globals['topmost'] and u32.GetWindow(hwnd, 3):
                 # Something is above Hornet -  reassert unless a menu or capturing
                 # popup is active (GetGUIThreadInfo catches Win32 menus incl.
@@ -1622,12 +1733,14 @@ def main():
                 if not (gti.flags & _GUI_INMENUMODE) and not u32.GetCapture():
                     _win_assert_topmost(hwnd)
             screen.fill(CHROMA_KEY)
-            screen.blit(hornet.display_frame(), (0, 0))
+            screen.blit(hornet.display_frame(), (0, Z_OVERHEAD))
+            hornet.draw_z_particles(screen, 0, Z_OVERHEAD)
         elif ARGB_MODE and offscreen:
             render_argb(screen, offscreen, hornet)
         else:
             screen.fill((0, 0, 0))
             hornet.draw(screen)
+            hornet.draw_z_particles(screen, *hornet.draw_pos())
 
         pygame.display.flip()
 
