@@ -1613,7 +1613,7 @@ def main():
             # Move the small window to follow the sprite (SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE)
             u32.SetWindowPos(hwnd, 0, draw_x, draw_y, 0, 0, 0x0015)
             if tray_globals['topmost'] and u32.GetWindow(hwnd, 3):
-                # Something is above Hornet — reassert unless a menu or capturing
+                # Something is above Hornet -  reassert unless a menu or capturing
                 # popup is active (GetGUIThreadInfo catches Win32 menus incl.
                 # custom-styled ones; GetCapture catches fully-custom popups).
                 gti = _GUITHREADINFO()
