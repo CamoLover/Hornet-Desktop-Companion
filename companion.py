@@ -449,16 +449,18 @@ def _num_sorted(pattern):
 def load_raw_assets():
     """Load sprite images without convert() -  safe to call before set_mode."""
     seqs = {
-        'idle':      _num_sorted(_resource('assets/sprites/idle/hornet_idle_*.png')),
-        'sit_down':  _num_sorted(_resource('assets/sprites/sit_down/sit_*.png')),
-        'sit_intro': _num_sorted(_resource('assets/sprites/sit_intro/sit_play_*.png')),
-        'sit_loop':  _num_sorted(_resource('assets/sprites/sit_loop/hornet_sit_play_*.png')),
-        'sit_outro': _num_sorted(_resource('assets/sprites/sit_outro/sit_end_*.png')),
-        'sit_up':    _num_sorted(_resource('assets/sprites/sit_up/sit_get_up_*.png')),
+        'idle':       _num_sorted(_resource('assets/sprites/idle/hornet_idle_*.png')),
+        'sit_down':   _num_sorted(_resource('assets/sprites/sit_down/sit_*.png')),
+        'sit_intro':  _num_sorted(_resource('assets/sprites/sit_intro/sit_play_*.png')),
+        'sit_loop':   _num_sorted(_resource('assets/sprites/sit_loop/hornet_sit_play_*.png')),
+        'sit_outro':  _num_sorted(_resource('assets/sprites/sit_outro/sit_end_*.png')),
+        'sit_up':     _num_sorted(_resource('assets/sprites/sit_up/sit_get_up_*.png')),
+        'sleep_wake': _num_sorted(_resource('assets/sprites/sleep_wake/sleep_wake_*.png')),
     }
     singles = {
         'FAST_FALL':       _resource('assets/sprites/fast_fall/hornet_fast_fall.png'),
         'FAST_FALL_WRONG': _resource('assets/sprites/fast_fall/hornet_fast_fall_wrong.png'),
+        'sleep':           _resource('assets\sprites\sleep_wake\sleep_wake_1.png'),
     }
     missing = [p for p in singles.values() if not os.path.exists(p)]
     missing += [f'assets/sprites/{k}/' for k, v in seqs.items() if not v]
@@ -543,6 +545,7 @@ WRONG_MIX     = 0.65
 ON_GROUND_TOL = 8
 SIT_Y_OFFSET  = 0.235
 IDLE_Y_OFFSET = -0.075
+SLEEP_Y_OFFSET = 0.12
 
 
 class Hornet:
@@ -553,19 +556,23 @@ class Hornet:
     SIT_FPS       = 0.1
     IDLE_FPS      = 0.15
     SIT_PAUSE_DUR = 0.25   # pause between sit_down→sit_intro and sit_outro→sit_up
+    SLEEP_FPS     = 0.08   # seconds per frame for sleep_wake animation
+    SLEEP_TIMEOUT = 300.0  # seconds of ground inactivity before falling asleep
 
     def __init__(self, x, y, sprites, seqs, floor_y):
         self.x = float(x);  self.y = float(y)
         self.vx = 0.0;      self.vy = 0.0
 
-        self.sprites          = sprites
-        self.idle_frames      = seqs['idle']
-        self.sit_down_frames  = seqs['sit_down']
-        self.sit_intro_frames = seqs['sit_intro']
-        self.sit_loop_frames  = seqs['sit_loop']
-        self.sit_outro_frames = seqs['sit_outro']
-        self.sit_up_frames    = seqs['sit_up']
-        self.floor_y          = floor_y
+        self.sprites            = sprites
+        self.idle_frames        = seqs['idle']
+        self.sit_down_frames    = seqs['sit_down']
+        self.sit_intro_frames   = seqs['sit_intro']
+        self.sit_loop_frames    = seqs['sit_loop']
+        self.sit_outro_frames   = seqs['sit_outro']
+        self.sit_up_frames      = seqs['sit_up']
+        self.sleep_wake_frames  = seqs['sleep_wake']
+        self.sleep_frame        = sprites['sleep']
+        self.floor_y            = floor_y
 
         self.state        = 'IDLE'
         self.facing_right = True
@@ -578,6 +585,12 @@ class Hornet:
         self.sit_phase = None
         self.sit_idx   = 0
         self.sit_timer = 0.0
+
+        # sleep_phase: None|'falling_asleep'|'sleeping'|'waking'
+        self.sleep_phase      = None
+        self.sleep_idx        = 0
+        self.sleep_timer      = 0.0
+        self.inactivity_timer = 0.0
 
         # Single-frame events consumed by main()
         self.ev_music_start = False
@@ -596,11 +609,22 @@ class Hornet:
         return self.sit_phase is not None
 
     @property
+    def sleeping(self):
+        return self.sleep_phase is not None
+
+    @property
     def _idle_w(self): return self.idle_frames[0].get_width()
     @property
     def _idle_h(self): return self.idle_frames[0].get_height()
 
     def current_frame(self) -> pygame.Surface:
+        if self.sleep_phase == 'falling_asleep':
+            rev = len(self.sleep_wake_frames) - 1 - self.sleep_idx
+            return self.sleep_wake_frames[rev]
+        if self.sleep_phase == 'sleeping':
+            return self.sleep_frame
+        if self.sleep_phase == 'waking':
+            return self.sleep_wake_frames[self.sleep_idx]
         if self.sit_phase == 'sit_down':
             return self.sit_down_frames[self.sit_idx]
         if self.sit_phase == 'sit_pause_pre':
@@ -630,12 +654,17 @@ class Hornet:
     def mouse_down(self, mx, my):
         if not self.is_clicked(mx, my):
             return
+        if self.sleep_phase in ('falling_asleep', 'waking'):
+            return  # ignore during sleep transitions
+        self.inactivity_timer = 0.0
         self._pending = True
         self._pend_mx = mx;  self._pend_my = my
         self._last_mx = mx;  self._last_my = my
         self._mvx = 0.0;     self._mvy = 0.0
 
     def mouse_move(self, mx, my, dt):
+        if self.sleeping:
+            return  # no dragging while asleep or transitioning
         if self._pending:
             if math.hypot(mx - self._pend_mx, my - self._pend_my) >= DRAG_PIXELS:
                 self._pending = False
@@ -649,6 +678,14 @@ class Hornet:
     def mouse_up(self, mx, my):
         if self._pending:
             self._pending = False
+            if self.sleep_phase == 'sleeping':
+                # Wake up on click
+                self.sleep_phase = 'waking'
+                self.sleep_idx   = 0
+                self.sleep_timer = 0.0
+                return
+            if self.sleeping:
+                return  # ignore during sleep transitions
             if self.sit_phase == 'sit_loop':
                 # Graceful exit: play the outro sequence
                 self.sit_phase = 'sit_outro'
@@ -690,6 +727,7 @@ class Hornet:
         self.dragging = False
         self.vx = self._mvx * 0.8
         self.vy = self._mvy * 0.8
+        self.inactivity_timer = 0.0
 
     # ── state ─────────────────────────────────────────────────────────────────
     def _upd_state(self):
@@ -765,8 +803,43 @@ class Hornet:
                 if self.sit_idx >= len(self.sit_up_frames):
                     self.sit_phase = None  # done -  back to idle
 
+    # ── sleep state machine ───────────────────────────────────────────────────
+    def _update_sleep(self, dt):
+        p = self.sleep_phase
+        n = len(self.sleep_wake_frames)
+
+        if p == 'falling_asleep':
+            self.sleep_timer += dt
+            if self.sleep_timer >= self.SLEEP_FPS:
+                self.sleep_timer = 0.0
+                self.sleep_idx += 1
+                if self.sleep_idx >= n:
+                    self.sleep_phase = 'sleeping'
+                    self.sleep_idx   = 0
+
+        elif p == 'waking':
+            self.sleep_timer += dt
+            if self.sleep_timer >= self.SLEEP_FPS:
+                self.sleep_timer = 0.0
+                self.sleep_idx += 1
+                if self.sleep_idx >= n:
+                    self.sleep_phase      = None
+                    self.sleep_idx        = 0
+                    self.inactivity_timer = 0.0
+
+    def _start_sleep(self):
+        self.vx           = 0.0
+        self.vy           = 0.0
+        self.sleep_phase  = 'falling_asleep'
+        self.sleep_idx    = 0
+        self.sleep_timer  = 0.0
+        self.inactivity_timer = 0.0
+
     # ── physics ───────────────────────────────────────────────────────────────
     def update(self, dt, screen_w):
+        if self.sleeping:
+            self._update_sleep(dt)
+            return
         if self.sitting:
             self._update_sit(dt)
             return
@@ -776,6 +849,14 @@ class Hornet:
             self.idle_idx = (self.idle_idx + 1) % len(self.idle_frames)
         if self.dragging:
             self._upd_state(); return
+        # Inactivity sleep: only count when resting on the ground
+        if self.is_on_ground():
+            self.inactivity_timer += dt
+            if self.inactivity_timer >= self.SLEEP_TIMEOUT:
+                self._start_sleep()
+                return
+        else:
+            self.inactivity_timer = 0.0
         if abs(self.vx) > 30:
             self.facing_right = self.vx > 0
         self.vy += self.GRAVITY * dt
@@ -797,7 +878,18 @@ class Hornet:
         self._upd_state()
 
     # ── draw ──────────────────────────────────────────────────────────────────
+    def _sleep_low_frame(self) -> bool:
+        """True for sleep_wake frames 5–10 (indices 4–9) that need sleep_y_offset."""
+        if self.sleep_phase == 'falling_asleep':
+            rev = len(self.sleep_wake_frames) - 1 - self.sleep_idx
+            return 4 <= rev <= 9
+        if self.sleep_phase == 'waking':
+            return 4 <= self.sleep_idx <= 9
+        return False
+
     def _sit_offset(self):
+        if self._sleep_low_frame():
+            return int(self._idle_h * SLEEP_Y_OFFSET)
         if not self.sitting:
             return 0
         base = int(self._idle_h * SIT_Y_OFFSET)
@@ -807,7 +899,9 @@ class Hornet:
         return base
 
     def _idle_y_offset(self):
-        return -int(self._idle_h * IDLE_Y_OFFSET) if not self.sitting else 0
+        if self.sitting or self._sleep_low_frame():
+            return 0
+        return -int(self._idle_h * IDLE_Y_OFFSET)
 
     def _sit_x_offset(self, frame: pygame.Surface) -> int:
         return (self._idle_w - frame.get_width()) // 2 if self.sitting else 0
@@ -827,6 +921,8 @@ class Hornet:
 
     def shape_key(self):
         """Hashable cache key for the current visible frame."""
+        if self.sleep_phase:
+            return ('sleep', self.sleep_phase, self.sleep_idx, self.facing_right)
         if self.sit_phase:
             return ('sit', self.sit_phase, self.sit_idx, self.facing_right)
         if self.state == 'IDLE':
@@ -856,10 +952,12 @@ _CONFIG_DEFAULTS = {
     'fast_fall_vy':  300.0,
     'wrong_mix':     0.65,
     'on_ground_tol': 8,
-    'sit_y_offset':  0.235,
-    'idle_y_offset': -0.075,
-    'volume':        1.0,
-    'scale':         100,
+    'sit_y_offset':   0.235,
+    'idle_y_offset':  -0.075,
+    'sleep_y_offset': 0.12,
+    'volume':         1.0,
+    'scale':          100,
+    'sleep_timeout':  300.0,
 }
 
 SPRITE_SCALE     = 1.0    # set by load_config()
@@ -868,7 +966,7 @@ _raw_seqs        = None
 _pending_rescale = False  # set True by load_config() when scale changes at runtime
 
 def load_config(apply_volume=False):
-    global FAST_FALL_VY, WRONG_MIX, ON_GROUND_TOL, SIT_Y_OFFSET, IDLE_Y_OFFSET, SPRITE_SCALE, _pending_rescale
+    global FAST_FALL_VY, WRONG_MIX, ON_GROUND_TOL, SIT_Y_OFFSET, IDLE_Y_OFFSET, SLEEP_Y_OFFSET, SPRITE_SCALE, _pending_rescale
     cfg = dict(_CONFIG_DEFAULTS)
     if os.path.exists(CONFIG_PATH):
         try:
@@ -885,13 +983,14 @@ def load_config(apply_volume=False):
         except Exception as e:
             print(f"[config] failed to write default {CONFIG_PATH}: {e}")
 
-    Hornet.GRAVITY       = float(cfg['gravity'])
-    Hornet.BOUNCE_DAMP   = float(cfg['bounce_damp'])
-    Hornet.FRICTION      = float(cfg['friction'])
-    Hornet.MIN_BOUNCE_VY = float(cfg['min_bounce_vy'])
-    Hornet.SIT_FPS       = float(cfg['sit_fps'])
-    Hornet.IDLE_FPS      = float(cfg['idle_fps'])
-    Hornet.SIT_PAUSE_DUR = float(cfg['sit_pause_dur'])
+    Hornet.GRAVITY        = float(cfg['gravity'])
+    Hornet.BOUNCE_DAMP    = float(cfg['bounce_damp'])
+    Hornet.FRICTION       = float(cfg['friction'])
+    Hornet.MIN_BOUNCE_VY  = float(cfg['min_bounce_vy'])
+    Hornet.SIT_FPS        = float(cfg['sit_fps'])
+    Hornet.IDLE_FPS       = float(cfg['idle_fps'])
+    Hornet.SIT_PAUSE_DUR  = float(cfg['sit_pause_dur'])
+    Hornet.SLEEP_TIMEOUT  = float(cfg['sleep_timeout'])
     new_scale = max(0.1, float(cfg['scale']) / 100.0)
     if apply_volume and abs(new_scale - SPRITE_SCALE) > 1e-6:
         _pending_rescale = True
@@ -899,8 +998,9 @@ def load_config(apply_volume=False):
     FAST_FALL_VY  = float(cfg['fast_fall_vy'])
     WRONG_MIX     = float(cfg['wrong_mix'])
     ON_GROUND_TOL = int(cfg['on_ground_tol'])
-    SIT_Y_OFFSET  = float(cfg['sit_y_offset'])
-    IDLE_Y_OFFSET = float(cfg['idle_y_offset'])
+    SIT_Y_OFFSET   = float(cfg['sit_y_offset'])
+    IDLE_Y_OFFSET  = float(cfg['idle_y_offset'])
+    SLEEP_Y_OFFSET = float(cfg['sleep_y_offset'])
     tray_globals['volume'] = float(cfg['volume'])
     if apply_volume:
         try:

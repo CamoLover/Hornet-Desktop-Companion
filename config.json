@@ -12,5 +12,7 @@
     "sit_y_offset": 0.23,
     "idle_y_offset": -0.025,
     "volume": 1.0,
-    "scale": 75
+    "scale": 75,
+    "sleep_timeout": 300.0,
+    "sleep_y_offset": 0.12
 }
