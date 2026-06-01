@@ -9,7 +9,7 @@
 [![Last Commit](https://img.shields.io/github/last-commit/CamoLover/Hornet-Desktop-Companion)](https://github.com/CamoLover/Hornet-Desktop-Companion/commits/main)
 [![Issues](https://img.shields.io/github/issues/CamoLover/Hornet-Desktop-Companion)](https://github.com/CamoLover/Hornet-Desktop-Companion/issues)
 
-*A physics-based desktop companion featuring Hornet from* Hollow Knight. *She sits, sleeps, falls with gravity, bounces off the floor, plays the Needoline soundtrack when sitting, and reacts to velocity with different sprites.*
+*A physics-based desktop companion featuring Hornet from* Hollow Knight. *She sits, sleeps, falls with gravity, bounces or soft-lands, plays the Needoline soundtrack when sitting, reacts to velocity with different sprites, and gets annoyed if you hover near her too long.*
 
 </div>
 
@@ -20,7 +20,9 @@
 - **Physics simulation** -  gravity, bounce damping, and friction
 - **Animated idle** -  6-frame idle animation cycle
 - **Full sitting sequence** -  sit-down → pause → intro → looping play → outro → pause → get-up, with smooth position transitions
-- **Sleep** -  after 5 minutes of inactivity on the ground, Hornet falls asleep; click her to wake up
+- **Sleep** -  after 5 minutes of inactivity on the ground, Hornet falls asleep; a small "z" floats above her head while she sleeps; click her to wake up
+- **Soft landing** -  optional mode where Hornet doesn't bounce; plays a landing animation on the floor, and wall-slide / wall-cling animations against screen edges
+- **Taunt** -  hover the cursor near Hornet long enough and she'll get annoyed and taunt you; has a cooldown
 - **Music** -  plays randomised segments of *Needoline* during the sitting loop; stops when she stands
 - **Velocity-reactive sprites** -  fast-fall and tumble sprites trigger based on speed and direction
 - **Tray icon** -  control volume, pick a song, and hot-reload config without restarting
@@ -98,10 +100,37 @@ If Hornet is left idle on the ground for `sleep_timeout` seconds (default 5 minu
 | Phase | Sprites | Notes |
 |---|---|---|
 | Falling asleep | `sleep_wake/sleep_wake_*.png` (reversed) | Plays once |
-| Sleeping | `sleep_wake/sleep_wake_1.png` | Held until clicked |
+| Sleeping | `sleep_wake/sleep_wake_1.png` | Held until clicked; a floating "z" is drawn above her head |
 | Waking | `sleep_wake/sleep_wake_*.png` (forward) | Plays once; returns to idle |
 
 Click her while she is sleeping to wake her up. The inactivity timer resets any time she is dragged, thrown, or clicked.
+
+The "z" overlay can be disabled by setting `sleep_z` to `false` in `config.json`.
+
+---
+
+## Soft Landing
+
+When `soft_land` is enabled in `config.json`, Hornet does not bounce on impact. Instead:
+
+| Situation | Sprites | Notes |
+|---|---|---|
+| Hitting the floor | `land/land_1–10.png` | Landing animation plays once, then transitions to idle |
+| Sliding down a wall | `wall_slide/wall_slide_1–9.png` | Plays while descending along a screen edge |
+| Reaching the wall bottom | `wall_cling/wall_cling_1–4.png` | Cling animation plays once before transitioning to idle |
+
+---
+
+## Taunt
+
+If the cursor hovers near Hornet for `taunt_hover_time` seconds (default 2.5 s) while she is idle or on the ground, she gets annoyed and plays her taunt animation.
+
+| Phase | Sprites |
+|---|---|
+| Taunt | `taunt/taunt_1–19.png` |
+| Silk effect | `taunt/taunt_silk_1–8.png` |
+
+After taunting, she enters a cooldown (`taunt_cooldown`, default 120 s) before she can be triggered again.
 
 ---
 
@@ -144,6 +173,13 @@ All values hot-reload instantly via **Tray → Reload Config**.
 | `sleep_y_offset` | `0.12` | Vertical position offset during sleep transition frames (fraction of sprite height) |
 | `volume` | `1.0` | Music volume (0.0 – 1.0) |
 | `scale` | `100` | Sprite scale percentage (50 = half size, 200 = double) |
+| `sleep_z` | `true` | Show a floating "z" above Hornet's head while she sleeps |
+| `soft_land` | `true` | Enable soft landing / wall-slide instead of bouncing |
+| `land_fps` | `0.04` | Seconds per frame for landing and wall-cling animations |
+| `wall_slide_fps` | `0.08` | Seconds per frame for the wall-slide animation |
+| `taunt_fps` | `0.06` | Seconds per frame for the taunt animation |
+| `taunt_cooldown` | `120.0` | Seconds before Hornet can be taunted again |
+| `taunt_hover_time` | `2.5` | Seconds the cursor must hover near Hornet to trigger a taunt |
 
 ---
 
@@ -162,6 +198,10 @@ All values hot-reload instantly via **Tray → Reload Config**.
 | `assets/sprites/sit_loop/` | Looping sit animation (11 frames) |
 | `assets/sprites/sit_outro/` | Outro from playing (4 frames) |
 | `assets/sprites/sit_up/` | Get-up transition (7 frames) |
+| `assets/sprites/land/` | Soft landing animation (10 frames) |
+| `assets/sprites/wall_slide/` | Wall-slide animation (9 frames) |
+| `assets/sprites/wall_cling/` | Wall-cling animation (4 frames) |
+| `assets/sprites/taunt/` | Taunt animation (19 frames + 8-frame silk effect) |
 | `assets/audio/needoline.mp3` | Background music track |
 | `assets/logo/` | App icon (PNG + ICO) |
 
