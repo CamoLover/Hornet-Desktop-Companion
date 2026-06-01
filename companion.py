@@ -283,6 +283,7 @@ tray_globals = {
     'auto_random_song': True,  # If False, always use current_song when sitting
     'hwnd': None,
     'sleep_z': True,           # Show floating Z's while sleeping
+    'soft_land': False,        # Play landing/wall-cling animations instead of bouncing
 }
 
 # Global music state (modified by both main loop and tray)
@@ -457,6 +458,9 @@ def load_raw_assets():
         'sit_outro':  _num_sorted(_resource('assets/sprites/sit_outro/sit_end_*.png')),
         'sit_up':     _num_sorted(_resource('assets/sprites/sit_up/sit_get_up_*.png')),
         'sleep_wake': _num_sorted(_resource('assets/sprites/sleep_wake/sleep_wake_*.png')),
+        'land':       _num_sorted(_resource('assets/sprites/land/land_*.png')),
+        'wall_cling': _num_sorted(_resource('assets/sprites/wall_cling/wall_cling_*.png')),
+        'wall_slide': _num_sorted(_resource('assets/sprites/wall_slide/wall_slide_*.png')),
     }
     singles = {
         'FAST_FALL':       _resource('assets/sprites/fast_fall/hornet_fast_fall.png'),
@@ -570,6 +574,8 @@ class Hornet:
     SIT_PAUSE_DUR = 0.25   # pause between sit_down→sit_intro and sit_outro→sit_up
     SLEEP_FPS     = 0.08   # seconds per frame for sleep_wake animation
     SLEEP_TIMEOUT = 300.0  # seconds of ground inactivity before falling asleep
+    LAND_FPS       = 0.04   # seconds per frame for land/wall-cling/wall-land animations
+    WALL_SLIDE_FPS = 0.08   # seconds per frame for wall-slide animation
 
     _z_font      = None
     _z_font_size = 0
@@ -587,6 +593,9 @@ class Hornet:
         self.sit_up_frames      = seqs['sit_up']
         self.sleep_wake_frames  = seqs['sleep_wake']
         self.sleep_frame        = sprites['sleep']
+        self.land_frames        = seqs['land']
+        self.wall_cling_frames  = seqs['wall_cling']
+        self.wall_slide_frames  = seqs['wall_slide']
         self.floor_y            = floor_y
 
         self.state        = 'IDLE'
@@ -608,6 +617,12 @@ class Hornet:
         self.inactivity_timer = 0.0
         self.z_particles      = []
         self.z_spawn_timer    = 0.0
+
+        # land_phase: None|'land'|'wall_cling'|'wall_slide'|'wall_land'
+        self.land_phase = None
+        self.land_idx   = 0
+        self.land_timer = 0.0
+        self.wall_side  = None  # 'left' | 'right'  — which wall she clung to
 
         # Single-frame events consumed by main()
         self.ev_music_start = False
@@ -642,6 +657,15 @@ class Hornet:
             return self.sleep_frame
         if self.sleep_phase == 'waking':
             return self.sleep_wake_frames[self.sleep_idx]
+        if self.land_phase == 'land':
+            return self.land_frames[self.land_idx]
+        if self.land_phase == 'wall_cling':
+            return self.wall_cling_frames[self.land_idx]
+        if self.land_phase == 'wall_slide':
+            return self.wall_slide_frames[self.land_idx]
+        if self.land_phase == 'wall_land':
+            # sleep_wake frames 11-14 are indices 10-13
+            return self.sleep_wake_frames[10 + self.land_idx]
         if self.sit_phase == 'sit_down':
             return self.sit_down_frames[self.sit_idx]
         if self.sit_phase == 'sit_pause_pre':
@@ -727,6 +751,7 @@ class Hornet:
         self.sit_timer = 0.0
 
     def _start_drag(self, mx, my):
+        self.land_phase = None
         self.dragging = True
         self._off_x = self.x - mx
         self._off_y = self.y - my
@@ -748,7 +773,7 @@ class Hornet:
 
     # ── state ─────────────────────────────────────────────────────────────────
     def _upd_state(self):
-        if self.sitting or self.dragging:
+        if self.sitting or self.dragging or self.land_phase is not None:
             self.state = 'IDLE'; return
         spd = math.hypot(self.vx, self.vy)
         if spd < 80 or self.vy <= 0:
@@ -846,6 +871,67 @@ class Hornet:
 
         self._update_z_particles(dt)
 
+    # ── landing / wall-cling state machine ────────────────────────────────────
+    def _update_land(self, dt, screen_w):
+        p = self.land_phase
+
+        if p == 'land':
+            self.land_timer += dt
+            if self.land_timer >= self.LAND_FPS:
+                self.land_timer = 0.0
+                self.land_idx += 1
+                if self.land_idx >= len(self.land_frames):
+                    self.land_phase = None  # back to idle
+
+        elif p == 'wall_cling':
+            if self.wall_side == 'right':
+                self.x = float(screen_w - self.wall_cling_frames[self.land_idx].get_width())
+            self.land_timer += dt
+            if self.land_timer >= self.LAND_FPS:
+                self.land_timer = 0.0
+                self.land_idx += 1
+                if self.land_idx >= len(self.wall_cling_frames):
+                    self.land_phase = 'wall_slide'
+                    self.land_idx   = 0
+                    self.land_timer = 0.0
+                    self.vy         = 0.0
+
+        elif p == 'wall_slide':
+            # Apply gravity so she slides down naturally
+            self.vy += self.GRAVITY * dt
+            self.y  += self.vy * dt
+            # Keep her pinned to the wall she clung to
+            if self.wall_side == 'left':
+                self.x = 0.0
+            else:
+                self.x = float(screen_w - self.wall_slide_frames[self.land_idx].get_width())
+            # Advance animation (clamp at last frame)
+            self.land_timer += dt
+            if self.land_timer >= self.WALL_SLIDE_FPS:
+                self.land_timer = 0.0
+                if self.land_idx < len(self.wall_slide_frames) - 1:
+                    self.land_idx += 1
+            # Transition to wall_land when she reaches the floor
+            if self.y >= self.floor_y:
+                self.y = self.floor_y
+                self.vy = 0.0
+                # Snap x back to the idle-width boundary so wake frames align with idle
+                if self.wall_side == 'right':
+                    self.x = float(screen_w - self._idle_w)
+                else:
+                    self.x = 0.0
+                self.land_phase = 'wall_land'
+                self.land_idx   = 0
+                self.land_timer = 0.0
+
+        elif p == 'wall_land':
+            self.land_timer += dt
+            if self.land_timer >= self.LAND_FPS:
+                self.land_timer = 0.0
+                self.land_idx += 1
+                if self.land_idx >= 4:  # sleep_wake frames 11-14 = 4 frames
+                    self.land_phase = None  # back to idle
+
     def _spawn_z_particle(self):
         sw = self.sleep_frame.get_width()
         sh = self.sleep_frame.get_height()
@@ -927,6 +1013,9 @@ class Hornet:
         if self.sitting:
             self._update_sit(dt)
             return
+        if self.land_phase is not None:
+            self._update_land(dt, screen_w)
+            return
         self.idle_timer += dt
         if self.idle_timer >= self.IDLE_FPS:
             self.idle_timer = 0.0
@@ -946,17 +1035,45 @@ class Hornet:
         self.vy += self.GRAVITY * dt
         self.x  += self.vx * dt
         self.y  += self.vy * dt
+        soft = tray_globals.get('soft_land', False)
         if self.y >= self.floor_y:
-            self.y  = self.floor_y
-            self.vy = -self.vy * self.BOUNCE_DAMP
-            self.vx *= self.FRICTION
-            if abs(self.vy) < self.MIN_BOUNCE_VY:
-                self.vy = 0.0
+            self.y = self.floor_y
+            if soft and abs(self.vy) * self.BOUNCE_DAMP >= self.MIN_BOUNCE_VY:
+                self.vy         = 0.0
+                self.vx         = 0.0
+                self.land_phase = 'land'
+                self.land_idx   = 0
+                self.land_timer = 0.0
+            else:
+                self.vy = -self.vy * self.BOUNCE_DAMP
+                self.vx *= self.FRICTION
+                if abs(self.vy) < self.MIN_BOUNCE_VY:
+                    self.vy = 0.0
         if self.x < 0:
-            self.x  = 0.0;  self.vx =  abs(self.vx) * self.BOUNCE_DAMP
+            self.x = 0.0
+            if soft and abs(self.vx) * self.BOUNCE_DAMP >= 50.0:
+                self.vx         = 0.0
+                self.vy         = 0.0
+                self.wall_side  = 'left'
+                self.facing_right = True
+                self.land_phase = 'wall_cling'
+                self.land_idx   = 0
+                self.land_timer = 0.0
+            else:
+                self.vx = abs(self.vx) * self.BOUNCE_DAMP
         elif self.x > screen_w - self._idle_w:
-            self.x  = float(screen_w - self._idle_w)
-            self.vx = -abs(self.vx) * self.BOUNCE_DAMP
+            if soft and abs(self.vx) * self.BOUNCE_DAMP >= 50.0:
+                self.vx         = 0.0
+                self.vy         = 0.0
+                self.wall_side  = 'right'
+                self.facing_right = False
+                self.land_phase = 'wall_cling'
+                self.land_idx   = 0
+                self.land_timer = 0.0
+                self.x = float(screen_w - self.wall_cling_frames[0].get_width())
+            else:
+                self.x  = float(screen_w - self._idle_w)
+                self.vx = -abs(self.vx) * self.BOUNCE_DAMP
         if self.y < 0:
             self.y  = 0.0;  self.vy = abs(self.vy) * self.BOUNCE_DAMP
         self._upd_state()
@@ -1007,6 +1124,8 @@ class Hornet:
         """Hashable cache key for the current visible frame."""
         if self.sleep_phase:
             return ('sleep', self.sleep_phase, self.sleep_idx, self.facing_right)
+        if self.land_phase:
+            return ('land', self.land_phase, self.land_idx, self.facing_right)
         if self.sit_phase:
             return ('sit', self.sit_phase, self.sit_idx, self.facing_right)
         if self.state == 'IDLE':
@@ -1026,22 +1145,24 @@ class Hornet:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CONFIG_DEFAULTS = {
-    'gravity':       1800.0,
-    'bounce_damp':   0.45,
-    'friction':      0.88,
-    'min_bounce_vy': 80.0,
-    'sit_fps':       0.1,
-    'idle_fps':      0.15,
-    'sit_pause_dur': 0.25,
-    'fast_fall_vy':  300.0,
-    'wrong_mix':     0.65,
-    'on_ground_tol': 8,
+    'gravity':        1800.0,
+    'bounce_damp':    0.45,
+    'friction':       0.88,
+    'min_bounce_vy':  80.0,
+    'sit_fps':        0.1,
+    'idle_fps':       0.15,
+    'sit_pause_dur':  0.25,
+    'fast_fall_vy':   300.0,
+    'wrong_mix':      0.65,
+    'on_ground_tol':  8,
     'sit_y_offset':   0.235,
     'idle_y_offset':  -0.075,
     'sleep_y_offset': 0.12,
     'volume':         1.0,
     'scale':          100,
     'sleep_timeout':  300.0,
+    'land_fps':       0.04,
+    'wall_slide_fps': 0.08,
 }
 
 SPRITE_SCALE     = 1.0    # set by load_config()
@@ -1074,7 +1195,9 @@ def load_config(apply_volume=False):
     Hornet.SIT_FPS        = float(cfg['sit_fps'])
     Hornet.IDLE_FPS       = float(cfg['idle_fps'])
     Hornet.SIT_PAUSE_DUR  = float(cfg['sit_pause_dur'])
-    Hornet.SLEEP_TIMEOUT  = float(cfg['sleep_timeout'])
+    Hornet.SLEEP_TIMEOUT   = float(cfg['sleep_timeout'])
+    Hornet.LAND_FPS        = float(cfg['land_fps'])
+    Hornet.WALL_SLIDE_FPS  = float(cfg['wall_slide_fps'])
     new_scale = max(0.1, float(cfg['scale']) / 100.0)
     if apply_volume and abs(new_scale - SPRITE_SCALE) > 1e-6:
         _pending_rescale = True
@@ -1165,6 +1288,9 @@ def _create_tray_icon(hwnd, hornet_ref):
             hornet_ref[0].z_particles  = []
             hornet_ref[0].z_spawn_timer = 0.0
 
+    def on_toggle_soft_land(icon=None, item=None):
+        tray_globals['soft_land'] = not tray_globals['soft_land']
+
     volume_items = [MenuItem(f'{int(v*100)}%', on_volume(v)) for v in [0.0,0.25,0.5,0.75,1.0]]
     song_items   = [MenuItem('Random', on_song(-1))] + [MenuItem(SONG_NAMES[i], on_song(i)) for i in range(len(SONG_NAMES))]
 
@@ -1174,6 +1300,8 @@ def _create_tray_icon(hwnd, hornet_ref):
             MenuItem('Volume', Menu(*volume_items)),
             MenuItem('Sleep Z\'s', on_toggle_sleep_z,
                      checked=lambda item: tray_globals['sleep_z']),
+            MenuItem('Soft Landing', on_toggle_soft_land,
+                     checked=lambda item: tray_globals['soft_land']),
             MenuItem('Reload Config', on_reload_config),
             MenuItem('Reset Topmost', on_reset_topmost),
             MenuItem('Quit', on_quit),
@@ -1262,6 +1390,9 @@ def _create_tray_icon_sni(hornet_ref):
             hornet_ref[0].z_particles  = []
             hornet_ref[0].z_spawn_timer = 0.0
 
+    def on_toggle_soft_land_cb():
+        tray_globals['soft_land'] = not tray_globals['soft_land']
+
     # ── Tkinter popup menu ─────────────────────────────────────────────────────
     def show_menu(x, y):
         def _run():
@@ -1295,6 +1426,9 @@ def _create_tray_icon_sni(hornet_ref):
                 sleep_z_var = tk.BooleanVar(value=tray_globals['sleep_z'])
                 pop.add_checkbutton(label="Sleep Z's", variable=sleep_z_var,
                                     command=close_run(on_toggle_sleep_z_cb))
+                soft_land_var = tk.BooleanVar(value=tray_globals['soft_land'])
+                pop.add_checkbutton(label='Soft Landing', variable=soft_land_var,
+                                    command=close_run(on_toggle_soft_land_cb))
                 pop.add_separator()
                 pop.add_command(label='Reload Config', command=close_run(on_reload_config_cb))
                 pop.add_command(label='Quit', command=close_run(on_quit_cb))
@@ -1703,6 +1837,9 @@ def main():
             hornet.sit_up_frames     = new_seqs['sit_up']
             hornet.sleep_wake_frames = new_seqs['sleep_wake']
             hornet.sleep_frame       = new_sprites['sleep']
+            hornet.land_frames       = new_seqs['land']
+            hornet.wall_cling_frames = new_seqs['wall_cling']
+            hornet.wall_slide_frames = new_seqs['wall_slide']
             old_floor_y    = hornet.floor_y
             hornet.floor_y = float(usable_h - new_seqs['idle'][0].get_height())
             hornet.y      += hornet.floor_y - old_floor_y

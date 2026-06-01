@@ -14,5 +14,7 @@
     "volume": 1.0,
     "scale": 75,
     "sleep_timeout": 300.0,
-    "sleep_y_offset": 0.12
+    "sleep_y_offset": 0.12,
+    "land_fps": 0.04,
+    "wall_slide_fps": 0.08
 }
