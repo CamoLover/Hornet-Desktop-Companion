@@ -461,6 +461,8 @@ def load_raw_assets():
         'land':       _num_sorted(_resource('assets/sprites/land/land_*.png')),
         'wall_cling': _num_sorted(_resource('assets/sprites/wall_cling/wall_cling_*.png')),
         'wall_slide': _num_sorted(_resource('assets/sprites/wall_slide/wall_slide_*.png')),
+        'taunt':      _num_sorted(_resource('assets/sprites/taunt/taunt_[0-9]*.png')),
+        'taunt_silk': _num_sorted(_resource('assets/sprites/taunt/taunt_silk_*.png')),
     }
     singles = {
         'FAST_FALL':       _resource('assets/sprites/fast_fall/hornet_fast_fall.png'),
@@ -576,6 +578,9 @@ class Hornet:
     SLEEP_TIMEOUT = 300.0  # seconds of ground inactivity before falling asleep
     LAND_FPS       = 0.04   # seconds per frame for land/wall-cling/wall-land animations
     WALL_SLIDE_FPS = 0.08   # seconds per frame for wall-slide animation
+    TAUNT_FPS      = 0.05   # seconds per frame for taunt animation
+    TAUNT_COOLDOWN = 120.0  # seconds before Hornet can be annoyed again
+    TAUNT_HOVER_TIME = 2.5  # seconds cursor must hover near Hornet to trigger taunt
 
     _z_font      = None
     _z_font_size = 0
@@ -596,6 +601,8 @@ class Hornet:
         self.land_frames        = seqs['land']
         self.wall_cling_frames  = seqs['wall_cling']
         self.wall_slide_frames  = seqs['wall_slide']
+        self.taunt_frames       = seqs['taunt']
+        self.taunt_silk_frames  = seqs['taunt_silk']
         self.floor_y            = floor_y
 
         self.state        = 'IDLE'
@@ -624,6 +631,13 @@ class Hornet:
         self.land_timer = 0.0
         self.wall_side  = None  # 'left' | 'right'  — which wall she clung to
 
+        # taunt state
+        self.taunt_phase         = None   # None | 'taunting'
+        self.taunt_idx           = 0
+        self.taunt_timer         = 0.0
+        self.taunt_cooldown_timer = 0.0   # counts down; taunt allowed when <= 0
+        self.taunt_hover_timer   = 0.0    # how long cursor has been near Hornet
+
         # Single-frame events consumed by main()
         self.ev_music_start = False
         self.ev_music_stop  = False
@@ -643,6 +657,10 @@ class Hornet:
     @property
     def sleeping(self):
         return self.sleep_phase is not None
+
+    @property
+    def taunting(self):
+        return self.taunt_phase is not None
 
     @property
     def _idle_w(self): return self.idle_frames[0].get_width()
@@ -666,6 +684,8 @@ class Hornet:
         if self.land_phase == 'wall_land':
             # sleep_wake frames 11-14 are indices 10-13
             return self.sleep_wake_frames[10 + self.land_idx]
+        if self.taunt_phase == 'taunting':
+            return self.taunt_frames[self.taunt_idx]
         if self.sit_phase == 'sit_down':
             return self.sit_down_frames[self.sit_idx]
         if self.sit_phase == 'sit_pause_pre':
@@ -1002,14 +1022,61 @@ class Hornet:
         self.z_particles  = []
         self.z_spawn_timer = 0.0
 
+    # ── taunt state machine ───────────────────────────────────────────────────
+    def _start_taunt(self):
+        self.taunt_phase         = 'taunting'
+        self.taunt_idx           = 0
+        self.taunt_timer         = 0.0
+        self.taunt_cooldown_timer = self.TAUNT_COOLDOWN
+        self.taunt_hover_timer   = 0.0
+
+    def _update_taunt(self, dt):
+        self.taunt_timer += dt
+        if self.taunt_timer >= self.TAUNT_FPS:
+            self.taunt_timer = 0.0
+            self.taunt_idx += 1
+            if self.taunt_idx >= len(self.taunt_frames):
+                self.taunt_phase = None
+                self.taunt_idx   = 0
+
+    def draw_taunt_silk(self, surface, ox, oy):
+        """Draw the silk layer behind Hornet during taunt frames 6–13 (1-indexed)."""
+        if self.taunt_phase != 'taunting':
+            return
+        # Silk appears during taunt frames 6–13 (0-indexed: 5–12)
+        if not (5 <= self.taunt_idx <= 12):
+            return
+        silk_raw = self.taunt_silk_frames[self.taunt_idx - 5]
+        if not self.facing_right:
+            silk_raw = pygame.transform.flip(silk_raw, True, False)
+        # Center silk on the taunt frame's center (ox/oy is the taunt frame's top-left)
+        taunt_frame = self.taunt_frames[self.taunt_idx]
+        sx = ox + (taunt_frame.get_width()  - silk_raw.get_width())  // 2
+        sy = oy + (taunt_frame.get_height() - silk_raw.get_height()) // 2
+        surface.blit(silk_raw, (sx, sy))
+
     # ── physics ───────────────────────────────────────────────────────────────
-    def update(self, dt, screen_w):
+    def update(self, dt, screen_w, mx=None, my=None):
+        # Tick cooldown regardless of state
+        if self.taunt_cooldown_timer > 0:
+            self.taunt_cooldown_timer -= dt
+
         if self.sleeping:
             self._update_sleep(dt)
             return
         # Keep ticking any Z particles still fading out after waking
         if self.z_particles:
             self._update_z_particles(dt)
+
+        # Taunt: cancel if dragged, otherwise update animation
+        if self.taunt_phase is not None:
+            if self.dragging:
+                self.taunt_phase = None
+                self.taunt_idx   = 0
+            else:
+                self._update_taunt(dt)
+                return
+
         if self.sitting:
             self._update_sit(dt)
             return
@@ -1022,6 +1089,24 @@ class Hornet:
             self.idle_idx = (self.idle_idx + 1) % len(self.idle_frames)
         if self.dragging:
             self._upd_state(); return
+
+        # Hover-proximity taunt trigger (idle on ground only)
+        if (mx is not None and my is not None
+                and self.is_on_ground()
+                and self.taunt_cooldown_timer <= 0
+                and self.land_phase is None):
+            cx = self.x + self._idle_w / 2
+            cy = self.y + self._idle_h / 2
+            if math.hypot(mx - cx, my - cy) <= self._idle_w:
+                self.taunt_hover_timer += dt
+                if self.taunt_hover_timer >= self.TAUNT_HOVER_TIME:
+                    self._start_taunt()
+                    return
+            else:
+                self.taunt_hover_timer = 0.0
+        else:
+            self.taunt_hover_timer = 0.0
+
         # Inactivity sleep: only count when resting on the ground
         if self.is_on_ground():
             self.inactivity_timer += dt
@@ -1126,6 +1211,8 @@ class Hornet:
             return ('sleep', self.sleep_phase, self.sleep_idx, self.facing_right)
         if self.land_phase:
             return ('land', self.land_phase, self.land_idx, self.facing_right)
+        if self.taunt_phase:
+            return ('taunt', self.taunt_idx, self.facing_right)
         if self.sit_phase:
             return ('sit', self.sit_phase, self.sit_idx, self.facing_right)
         if self.state == 'IDLE':
@@ -1165,6 +1252,9 @@ _CONFIG_DEFAULTS = {
     'wall_slide_fps': 0.08,
     'sleep_z':        True,
     'soft_land':      False,
+    'taunt_fps':      0.05,
+    'taunt_cooldown': 120.0,
+    'taunt_hover_time': 2.5,
 }
 
 SPRITE_SCALE     = 1.0    # set by load_config()
@@ -1216,6 +1306,9 @@ def load_config(apply_volume=False):
     Hornet.SLEEP_TIMEOUT   = float(cfg['sleep_timeout'])
     Hornet.LAND_FPS        = float(cfg['land_fps'])
     Hornet.WALL_SLIDE_FPS  = float(cfg['wall_slide_fps'])
+    Hornet.TAUNT_FPS       = float(cfg['taunt_fps'])
+    Hornet.TAUNT_COOLDOWN  = float(cfg['taunt_cooldown'])
+    Hornet.TAUNT_HOVER_TIME = float(cfg['taunt_hover_time'])
     new_scale = max(0.1, float(cfg['scale']) / 100.0)
     if apply_volume and abs(new_scale - SPRITE_SCALE) > 1e-6:
         _pending_rescale = True
@@ -1246,6 +1339,7 @@ def load_config(apply_volume=False):
 
 def render_argb(screen, offscreen, hornet):
     offscreen.fill((0, 0, 0, 0))
+    hornet.draw_taunt_silk(offscreen, *hornet.draw_pos())
     hornet.draw(offscreen)
     hornet.draw_z_particles(offscreen, *hornet.draw_pos())
     pygame.surfarray.blit_array(screen, pygame.surfarray.array2d(offscreen))
@@ -1826,7 +1920,7 @@ def main():
             elif event.type == pygame.MOUSEMOTION:
                 hornet.mouse_move(mx, my, dt)
 
-        hornet.update(dt, screen_w)
+        hornet.update(dt, screen_w, mx, my)
 
         # Consume sit animation events
         if hornet.ev_music_start:
@@ -1866,6 +1960,8 @@ def main():
             hornet.land_frames       = new_seqs['land']
             hornet.wall_cling_frames = new_seqs['wall_cling']
             hornet.wall_slide_frames = new_seqs['wall_slide']
+            hornet.taunt_frames      = new_seqs['taunt']
+            hornet.taunt_silk_frames = new_seqs['taunt_silk']
             old_floor_y    = hornet.floor_y
             hornet.floor_y = float(usable_h - new_seqs['idle'][0].get_height())
             hornet.y      += hornet.floor_y - old_floor_y
@@ -1893,7 +1989,11 @@ def main():
             # Window is positioned Z_OVERHEAD pixels above the sprite so Z particles have
             # room to float upward without being clipped.
             z_oh = int(Z_OVERHEAD * SPRITE_SCALE)
-            u32.SetWindowPos(hwnd, 0, draw_x, draw_y - z_oh, 0, 0, 0x0015)
+            # Center the current frame horizontally within the window so that
+            # wider layers (taunt silk) don't overflow and get clipped on the sides.
+            frame = hornet.display_frame()
+            frame_x = (screen.get_width() - frame.get_width()) // 2
+            u32.SetWindowPos(hwnd, 0, draw_x - frame_x, draw_y - z_oh, 0, 0, 0x0015)
             if tray_globals['topmost'] and u32.GetWindow(hwnd, 3):
                 # Something is above Hornet -  reassert unless a menu or capturing
                 # popup is active (GetGUIThreadInfo catches Win32 menus incl.
@@ -1904,12 +2004,14 @@ def main():
                 if not (gti.flags & _GUI_INMENUMODE) and not u32.GetCapture():
                     _win_assert_topmost(hwnd)
             screen.fill(CHROMA_KEY)
-            screen.blit(hornet.display_frame(), (0, z_oh))
-            hornet.draw_z_particles(screen, 0, z_oh)
+            hornet.draw_taunt_silk(screen, frame_x, z_oh)
+            screen.blit(frame, (frame_x, z_oh))
+            hornet.draw_z_particles(screen, frame_x, z_oh)
         elif ARGB_MODE and offscreen:
             render_argb(screen, offscreen, hornet)
         else:
             screen.fill((0, 0, 0))
+            hornet.draw_taunt_silk(screen, *hornet.draw_pos())
             hornet.draw(screen)
             hornet.draw_z_particles(screen, *hornet.draw_pos())
 
