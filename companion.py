@@ -1163,12 +1163,30 @@ _CONFIG_DEFAULTS = {
     'sleep_timeout':  300.0,
     'land_fps':       0.04,
     'wall_slide_fps': 0.08,
+    'sleep_z':        True,
+    'soft_land':      False,
 }
 
 SPRITE_SCALE     = 1.0    # set by load_config()
 _raw_sprites     = None   # stored after load_raw_assets() so runtime rescale can re-convert
 _raw_seqs        = None
 _pending_rescale = False  # set True by load_config() when scale changes at runtime
+
+def _save_config_key(key, value):
+    """Persist a single key back to config.json without touching other values."""
+    cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+    cfg[key] = value
+    try:
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(cfg, f, indent=4)
+    except Exception as e:
+        print(f"[config] failed to save {key}: {e}")
 
 def load_config(apply_volume=False):
     global FAST_FALL_VY, WRONG_MIX, ON_GROUND_TOL, SIT_Y_OFFSET, IDLE_Y_OFFSET, SLEEP_Y_OFFSET, SPRITE_SCALE, _pending_rescale
@@ -1208,7 +1226,9 @@ def load_config(apply_volume=False):
     SIT_Y_OFFSET   = float(cfg['sit_y_offset'])
     IDLE_Y_OFFSET  = float(cfg['idle_y_offset'])
     SLEEP_Y_OFFSET = float(cfg['sleep_y_offset'])
-    tray_globals['volume'] = float(cfg['volume'])
+    tray_globals['volume']    = float(cfg['volume'])
+    tray_globals['sleep_z']   = bool(cfg['sleep_z'])
+    tray_globals['soft_land'] = bool(cfg['soft_land'])
     if apply_volume:
         try:
             pygame.mixer.music.set_volume(tray_globals['volume'])
@@ -1266,6 +1286,7 @@ def _create_tray_icon(hwnd, hornet_ref):
         def handler(icon=None, item=None):
             tray_globals['volume'] = vol
             pygame.mixer.music.set_volume(vol)
+            _save_config_key('volume', vol)
         return handler
 
     def on_quit(icon=None, item=None):
@@ -1287,9 +1308,11 @@ def _create_tray_icon(hwnd, hornet_ref):
         if not tray_globals['sleep_z'] and hornet_ref[0]:
             hornet_ref[0].z_particles  = []
             hornet_ref[0].z_spawn_timer = 0.0
+        _save_config_key('sleep_z', tray_globals['sleep_z'])
 
     def on_toggle_soft_land(icon=None, item=None):
         tray_globals['soft_land'] = not tray_globals['soft_land']
+        _save_config_key('soft_land', tray_globals['soft_land'])
 
     volume_items = [MenuItem(f'{int(v*100)}%', on_volume(v)) for v in [0.0,0.25,0.5,0.75,1.0]]
     song_items   = [MenuItem('Random', on_song(-1))] + [MenuItem(SONG_NAMES[i], on_song(i)) for i in range(len(SONG_NAMES))]
@@ -1374,6 +1397,7 @@ def _create_tray_icon_sni(hornet_ref):
         def cb():
             tray_globals['volume'] = vol
             pygame.mixer.music.set_volume(vol)
+            _save_config_key('volume', vol)
         return cb
 
     def on_quit_cb():
@@ -1389,9 +1413,11 @@ def _create_tray_icon_sni(hornet_ref):
         if not tray_globals['sleep_z'] and hornet_ref[0]:
             hornet_ref[0].z_particles  = []
             hornet_ref[0].z_spawn_timer = 0.0
+        _save_config_key('sleep_z', tray_globals['sleep_z'])
 
     def on_toggle_soft_land_cb():
         tray_globals['soft_land'] = not tray_globals['soft_land']
+        _save_config_key('soft_land', tray_globals['soft_land'])
 
     # ── Tkinter popup menu ─────────────────────────────────────────────────────
     def show_menu(x, y):

@@ -16,5 +16,7 @@
     "sleep_timeout": 300.0,
     "sleep_y_offset": 0.12,
     "land_fps": 0.04,
-    "wall_slide_fps": 0.08
+    "wall_slide_fps": 0.08,
+    "sleep_z": true,
+    "soft_land": false
 }
