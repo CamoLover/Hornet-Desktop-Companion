@@ -1738,6 +1738,14 @@ def main():
     load_config()
     pygame.mixer.pre_init(44100, -16, 2, 2048)
     pygame.init()
+    # Allow only the event types this app uses. Pygame 2.x + Python 3.10 raises
+    # SystemError(KeyError: 1) inside event.get() when processing SDL window
+    # sub-events (e.g. WINDOWSHOWN=1) whose type isn't in pygame's internal map.
+    # Blocking all unneeded events prevents pygame from ever hitting that path.
+    pygame.event.set_allowed([
+        pygame.QUIT, pygame.KEYDOWN,
+        pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION,
+    ])
     # SDL may fail to open the default audio device on PipeWire/PulseAudio systems.
     # Retry with explicit drivers until one works.
     if not pygame.mixer.get_init():
