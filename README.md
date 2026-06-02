@@ -8,6 +8,7 @@
 [![Stars](https://img.shields.io/github/stars/CamoLover/Hornet-Desktop-Companion?style=social)](https://github.com/CamoLover/Hornet-Desktop-Companion/stargazers)
 [![Last Commit](https://img.shields.io/github/last-commit/CamoLover/Hornet-Desktop-Companion)](https://github.com/CamoLover/Hornet-Desktop-Companion/commits/main)
 [![Issues](https://img.shields.io/github/issues/CamoLover/Hornet-Desktop-Companion)](https://github.com/CamoLover/Hornet-Desktop-Companion/issues)
+![GitHub Repo Views](https://gitviews.com/repo/CamoLover/Hornet-Desktop-Companion.svg)
 
 *A physics-based desktop companion featuring Hornet from* Hollow Knight. *She sits, sleeps, falls with gravity, bounces or soft-lands, plays the Needoline soundtrack when sitting, reacts to velocity with different sprites, and gets annoyed if you hover near her too long.*
 
