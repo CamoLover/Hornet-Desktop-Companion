@@ -467,7 +467,7 @@ def load_raw_assets():
     singles = {
         'FAST_FALL':       _resource('assets/sprites/fast_fall/hornet_fast_fall.png'),
         'FAST_FALL_WRONG': _resource('assets/sprites/fast_fall/hornet_fast_fall_wrong.png'),
-        'sleep':           _resource('assets\sprites\sleep_wake\sleep_wake_1.png'),
+        'sleep':           _resource('assets/sprites/sleep_wake/sleep_wake_1.png'),
     }
     missing = [p for p in singles.values() if not os.path.exists(p)]
     missing += [f'assets/sprites/{k}/' for k, v in seqs.items() if not v]
