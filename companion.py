@@ -949,6 +949,7 @@ class Hornet:
                     self.x = float(screen_w - self._idle_w)
                 else:
                     self.x = 0.0
+                self.facing_right = (self.wall_side == 'right')
                 self.land_phase = 'wall_land'
                 self.land_idx   = 0
                 self.land_timer = 0.0
