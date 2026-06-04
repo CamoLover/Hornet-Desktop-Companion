@@ -12,6 +12,8 @@
 
 *A physics-based desktop companion featuring Hornet from* Hollow Knight. *She sits, sleeps, falls with gravity, bounces or soft-lands, plays the Needoline soundtrack when sitting, reacts to velocity with different sprites, and gets annoyed if you hover near her too long.*
 
+![Hornet Desktop Companion demo](assets/hdc.gif)
+
 </div>
 
 ---
