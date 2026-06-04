@@ -756,6 +756,15 @@ class Hornet:
             elif self.sit_phase is not None:
                 pass  # Ignore clicks during transition animations
             elif self.is_on_ground():
+                # Clear any overlapping states whose frames and update priority would
+                # shadow the sit animation: land frame renders on top of sit frames in
+                # current_frame(), and taunt blocks _update_sit() via early return.
+                self.land_phase  = None
+                self.land_idx    = 0
+                self.land_timer  = 0.0
+                self.taunt_phase = None
+                self.taunt_idx   = 0
+                self.taunt_timer = 0.0
                 self.sit_phase = 'sit_down'
                 self.sit_idx   = 0
                 self.sit_timer = 0.0
