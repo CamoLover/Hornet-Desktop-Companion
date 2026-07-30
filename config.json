@@ -22,5 +22,6 @@
     "taunt_fps": 0.06,
     "taunt_cooldown": 120.0,
     "taunt_hover_time": 2.5,
-    "cloak_color": "default"
+    "cloak_color": "default",
+    "spawn_mode": "walk_from_left"
 }

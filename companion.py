@@ -203,6 +203,10 @@ def _find_argb_visual():
 
 SCREEN_W = SCREEN_H = 0
 USABLE_H = 0           # bottom of work area (where taskbar starts)
+# Virtual screen bounds spanning all monitors (used to spawn Hornet off-screen
+# for the walk-in entrance regardless of multi-monitor layout).
+VIRT_LEFT  = 0
+VIRT_RIGHT = 0
 ARGB_MODE = False
 
 if PLAT == 'Linux':
@@ -214,6 +218,11 @@ if PLAT == 'Linux':
     # --- work area (above taskbar) ---
     wa = _workarea_linux()
     USABLE_H = (wa[1] + wa[3]) if wa else SCREEN_H  # y + h = bottom of usable area
+
+    # xrandr's "current" size already spans the full virtual desktop and
+    # monitor origins are typically at x=0.
+    VIRT_LEFT  = 0
+    VIRT_RIGHT = SCREEN_W
 
     # --- ARGB visual (skip on Wayland) ---
     if not os.environ.get('WAYLAND_DISPLAY'):
@@ -227,6 +236,9 @@ elif PLAT == 'Windows':
     # Physical screen size
     SCREEN_W = ctypes.windll.user32.GetSystemMetrics(0)   # SM_CXSCREEN
     SCREEN_H = ctypes.windll.user32.GetSystemMetrics(1)   # SM_CYSCREEN
+    # Virtual screen (spans all monitors) for multi-monitor walk-in spawns
+    VIRT_LEFT  = ctypes.windll.user32.GetSystemMetrics(76)                        # SM_XVIRTUALSCREEN
+    VIRT_RIGHT = VIRT_LEFT + ctypes.windll.user32.GetSystemMetrics(78)            # + SM_CXVIRTUALSCREEN
     # Work area bottom = where taskbar starts (SPI_GETWORKAREA = 48)
     _rc = _wt.RECT()
     ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(_rc), 0)
@@ -285,6 +297,7 @@ tray_globals = {
     'sleep_z': True,           # Show floating Z's while sleeping
     'soft_land': False,        # Play landing/wall-cling animations instead of bouncing
     'cloak_color': 'default',  # Cloak hue: 'default' or '#RRGGBB'
+    'spawn_mode': 'fall',      # 'fall' | 'walk_from_right' | 'walk_from_left'
 }
 
 # Global music state (modified by both main loop and tray)
@@ -464,6 +477,8 @@ def load_raw_assets():
         'wall_slide': _num_sorted(_resource('assets/sprites/wall_slide/wall_slide_*.png')),
         'taunt':      _num_sorted(_resource('assets/sprites/taunt/taunt_[0-9]*.png')),
         'taunt_silk': _num_sorted(_resource('assets/sprites/taunt/taunt_silk_*.png')),
+        'walk':       _num_sorted(_resource('assets/sprites/walk/walk_*.png')),
+        'walk_stop':  _num_sorted(_resource('assets/sprites/walk_stop/walkstop_*.png')),
     }
     singles = {
         'FAST_FALL':       _resource('assets/sprites/fast_fall/hornet_fast_fall.png'),
@@ -639,6 +654,9 @@ class Hornet:
     TAUNT_FPS      = 0.05   # seconds per frame for taunt animation
     TAUNT_COOLDOWN = 120.0  # seconds before Hornet can be annoyed again
     TAUNT_HOVER_TIME = 2.5  # seconds cursor must hover near Hornet to trigger taunt
+    WALK_FPS       = 0.06   # seconds per frame for the walk-in entrance
+    WALK_STOP_FPS  = 0.08   # seconds per frame for the walk-in stop animation
+    WALK_SPEED     = 240.0  # px/sec while walking on-screen at the entrance
 
     _z_font      = None
     _z_font_size = 0
@@ -661,6 +679,8 @@ class Hornet:
         self.wall_slide_frames  = seqs['wall_slide']
         self.taunt_frames       = seqs['taunt']
         self.taunt_silk_frames  = seqs['taunt_silk']
+        self.walk_frames        = seqs['walk']
+        self.walk_stop_frames   = seqs['walk_stop']
         self.floor_y            = floor_y
 
         self.state        = 'IDLE'
@@ -696,6 +716,13 @@ class Hornet:
         self.taunt_cooldown_timer = 0.0   # counts down; taunt allowed when <= 0
         self.taunt_hover_timer   = 0.0    # how long cursor has been near Hornet
 
+        # walk-in entrance state: None | 'walking' | 'stopping'
+        self.walk_in_phase    = None
+        self.walk_in_idx      = 0
+        self.walk_in_timer    = 0.0
+        self.walk_in_target_x = 0.0
+        self.walk_in_dir      = 0        # -1 = walking left, +1 = walking right
+
         # Single-frame events consumed by main()
         self.ev_music_start = False
         self.ev_music_stop  = False
@@ -721,11 +748,19 @@ class Hornet:
         return self.taunt_phase is not None
 
     @property
+    def walking_in(self):
+        return self.walk_in_phase is not None
+
+    @property
     def _idle_w(self): return self.idle_frames[0].get_width()
     @property
     def _idle_h(self): return self.idle_frames[0].get_height()
 
     def current_frame(self) -> pygame.Surface:
+        if self.walk_in_phase == 'walking':
+            return self.walk_frames[self.walk_in_idx]
+        if self.walk_in_phase == 'stopping':
+            return self.walk_stop_frames[self.walk_in_idx]
         if self.sleep_phase == 'falling_asleep':
             rev = len(self.sleep_wake_frames) - 1 - self.sleep_idx
             return self.sleep_wake_frames[rev]
@@ -839,6 +874,10 @@ class Hornet:
 
     def _start_drag(self, mx, my):
         self.land_phase = None
+        # Grabbing during the walk-in entrance cancels it so the user is in control.
+        self.walk_in_phase = None
+        self.walk_in_idx   = 0
+        self.walk_in_timer = 0.0
         self.dragging = True
         self._off_x = self.x - mx
         self._off_y = self.y - my
@@ -1123,11 +1162,63 @@ class Hornet:
         sy = oy + (taunt_frame.get_height() - silk_raw.get_height()) // 2
         surface.blit(silk_raw, (sx, sy))
 
+    # ── walk-in entrance state machine ────────────────────────────────────────
+    def _start_walk_in(self, from_side, target_x):
+        """Begin the walk-in entrance from off-screen.
+        from_side: 'right' (walk leftward) | 'left' (walk rightward).
+        target_x: x-coord where the walk should stop (Hornet's top-left).
+        Source sprites face left; facing_right=True renders unmirrored (left-facing),
+        facing_right=False flips to right-facing — same convention used everywhere."""
+        self.walk_in_phase    = 'walking'
+        self.walk_in_idx      = 0
+        self.walk_in_timer    = 0.0
+        self.walk_in_target_x = float(target_x)
+        if from_side == 'right':
+            self.walk_in_dir  = -1
+            self.facing_right = True   # walking leftward → source orientation
+        else:
+            self.walk_in_dir  = +1
+            self.facing_right = False  # walking rightward → flipped
+        self.vx = 0.0
+        self.vy = 0.0
+        self.y  = self.floor_y
+
+    def _update_walk_in(self, dt):
+        if self.walk_in_phase == 'walking':
+            self.x += self.WALK_SPEED * self.walk_in_dir * dt
+            reached = (self.walk_in_dir < 0 and self.x <= self.walk_in_target_x) or \
+                      (self.walk_in_dir > 0 and self.x >= self.walk_in_target_x)
+            if reached:
+                self.x = self.walk_in_target_x
+                self.walk_in_phase = 'stopping'
+                self.walk_in_idx   = 0
+                self.walk_in_timer = 0.0
+                return
+            self.walk_in_timer += dt
+            if self.walk_in_timer >= self.WALK_FPS:
+                self.walk_in_timer = 0.0
+                self.walk_in_idx = (self.walk_in_idx + 1) % len(self.walk_frames)
+        elif self.walk_in_phase == 'stopping':
+            self.walk_in_timer += dt
+            if self.walk_in_timer >= self.WALK_STOP_FPS:
+                self.walk_in_timer = 0.0
+                self.walk_in_idx += 1
+                if self.walk_in_idx >= len(self.walk_stop_frames):
+                    self.walk_in_phase = None
+                    self.walk_in_idx   = 0
+                    # facing_right is preserved so the idle sprite keeps the same
+                    # inward-facing orientation Hornet had while stopping.
+
     # ── physics ───────────────────────────────────────────────────────────────
     def update(self, dt, screen_w, mx=None, my=None):
         # Tick cooldown regardless of state
         if self.taunt_cooldown_timer > 0:
             self.taunt_cooldown_timer -= dt
+
+        # Walk-in entrance overrides all other state until it completes.
+        if self.walk_in_phase is not None:
+            self._update_walk_in(dt)
+            return
 
         if self.sleeping:
             self._update_sleep(dt)
@@ -1275,6 +1366,8 @@ class Hornet:
 
     def shape_key(self):
         """Hashable cache key for the current visible frame."""
+        if self.walk_in_phase:
+            return ('walk_in', self.walk_in_phase, self.walk_in_idx, self.facing_right)
         if self.sleep_phase:
             return ('sleep', self.sleep_phase, self.sleep_idx, self.facing_right)
         if self.land_phase:
@@ -1324,7 +1417,10 @@ _CONFIG_DEFAULTS = {
     'taunt_cooldown': 120.0,
     'taunt_hover_time': 2.5,
     'cloak_color': 'default',
+    'spawn_mode':  'fall',
 }
+
+_SPAWN_MODES = ('fall', 'walk_from_right', 'walk_from_left')
 
 SPRITE_SCALE     = 1.0    # set by load_config()
 CLOAK_COLOR      = 'default'  # set by load_config(); 'default' or '#RRGGBB'
@@ -1351,6 +1447,14 @@ def _set_cloak_color(hex_color):
     tray_globals['cloak_color'] = hex_color
     _save_config_key('cloak_color', hex_color)
     _pending_rescale = True
+
+
+def _set_spawn_mode(mode):
+    """Set spawn mode at runtime and persist. Applies on next launch."""
+    if mode not in _SPAWN_MODES:
+        return
+    tray_globals['spawn_mode'] = mode
+    _save_config_key('spawn_mode', mode)
 
 
 def _save_config_key(key, value):
@@ -1416,6 +1520,10 @@ def load_config(apply_volume=False):
     tray_globals['sleep_z']     = bool(cfg['sleep_z'])
     tray_globals['soft_land']   = bool(cfg['soft_land'])
     tray_globals['cloak_color'] = CLOAK_COLOR
+    sm = str(cfg['spawn_mode'])
+    if sm not in _SPAWN_MODES:
+        sm = 'fall'
+    tray_globals['spawn_mode'] = sm
     if apply_volume:
         try:
             pygame.mixer.music.set_volume(tray_globals['volume'])
@@ -1507,6 +1615,11 @@ def _create_tray_icon(hwnd, hornet_ref):
             _set_cloak_color(color_val)
         return handler
 
+    def on_spawn_mode(mode):
+        def handler(icon=None, item=None):
+            _set_spawn_mode(mode)
+        return handler
+
     def on_cloak_custom(icon=None, item=None):
         def _pick():
             try:
@@ -1535,11 +1648,24 @@ def _create_tray_icon(hwnd, hornet_ref):
         for label, val in _CLOAK_PRESETS
     ] + [MenuItem('Custom…', on_cloak_custom)]
 
+    def _spawn_checked(val):
+        return lambda item: tray_globals.get('spawn_mode', 'fall') == val
+
+    spawn_items = [
+        MenuItem('Fall (Default)',    on_spawn_mode('fall'),
+                 checked=_spawn_checked('fall'), radio=True),
+        MenuItem('Walk from Right',   on_spawn_mode('walk_from_right'),
+                 checked=_spawn_checked('walk_from_right'), radio=True),
+        MenuItem('Walk from Left',    on_spawn_mode('walk_from_left'),
+                 checked=_spawn_checked('walk_from_left'), radio=True),
+    ]
+
     def build_menu():
         return Menu(
             MenuItem('Songs', Menu(*song_items)),
             MenuItem('Volume', Menu(*volume_items)),
             MenuItem('Cloak Color', Menu(*cloak_items)),
+            MenuItem('Spawn Mode', Menu(*spawn_items)),
             MenuItem('Sleep Z\'s', on_toggle_sleep_z,
                      checked=lambda item: tray_globals['sleep_z']),
             MenuItem('Soft Landing', on_toggle_soft_land,
@@ -1642,6 +1768,10 @@ def _create_tray_icon_sni(hornet_ref):
         def cb(): _set_cloak_color(val)
         return cb
 
+    def on_spawn_mode_cb(val):
+        def cb(): _set_spawn_mode(val)
+        return cb
+
     # ── Tkinter popup menu ─────────────────────────────────────────────────────
     def show_menu(x, y):
         def _run():
@@ -1697,6 +1827,16 @@ def _create_tray_icon_sni(hornet_ref):
                 cm.add_separator()
                 cm.add_command(label='Custom…', command=open_color_picker)
                 pop.add_cascade(label='Cloak Color', menu=cm)
+
+                spm = tk.Menu(pop, tearoff=0)
+                cur_spawn = tray_globals.get('spawn_mode', 'fall')
+                spawn_var = tk.StringVar(value=cur_spawn)
+                for label, val in (('Fall (Default)', 'fall'),
+                                    ('Walk from Right', 'walk_from_right'),
+                                    ('Walk from Left', 'walk_from_left')):
+                    spm.add_radiobutton(label=label, value=val, variable=spawn_var,
+                                        command=close_run(on_spawn_mode_cb(val)))
+                pop.add_cascade(label='Spawn Mode', menu=spm)
 
                 pop.add_separator()
                 sleep_z_var = tk.BooleanVar(value=tray_globals['sleep_z'])
@@ -1997,14 +2137,29 @@ def main():
     idle_h  = seqs['idle'][0].get_height()
     floor_y = float(usable_h - idle_h)
 
+    idle_w = seqs['idle'][0].get_width()
+    center_x = float(screen_w // 2 - idle_w // 2)
+    spawn_mode = tray_globals.get('spawn_mode', 'fall')
+
     hornet = Hornet(
-        x       = float(screen_w//2 - seqs['idle'][0].get_width()//2),
+        x       = center_x,
         y       = 50.0,
         sprites = sprites,
         seqs    = seqs,
         floor_y = floor_y,
     )
-    hornet.vy = 120.0
+    # Virtual-screen extents span every monitor; fall back to the primary
+    # screen when they weren't detected.
+    virt_right = VIRT_RIGHT if VIRT_RIGHT else screen_w
+    virt_left  = VIRT_LEFT  if VIRT_RIGHT else 0
+    if spawn_mode == 'walk_from_right':
+        hornet.x = float(virt_right)
+        hornet._start_walk_in('right', center_x)
+    elif spawn_mode == 'walk_from_left':
+        hornet.x = float(virt_left - idle_w)
+        hornet._start_walk_in('left', center_x)
+    else:
+        hornet.vy = 120.0
 
     offscreen = (pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
                  if ARGB_MODE else None)
@@ -2126,6 +2281,8 @@ def main():
             hornet.wall_slide_frames = new_seqs['wall_slide']
             hornet.taunt_frames      = new_seqs['taunt']
             hornet.taunt_silk_frames = new_seqs['taunt_silk']
+            hornet.walk_frames       = new_seqs['walk']
+            hornet.walk_stop_frames  = new_seqs['walk_stop']
             old_floor_y    = hornet.floor_y
             hornet.floor_y = float(usable_h - new_seqs['idle'][0].get_height())
             hornet.y      += hornet.floor_y - old_floor_y
