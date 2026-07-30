@@ -10,7 +10,7 @@ _sysdir = '/usr/lib/python3/dist-packages'
 if _sysdir not in _sys.path:
     _sys.path.insert(0, _sysdir)
 
-import os, sys, math, glob, platform, ctypes, ctypes.util, subprocess, re, random, threading, json
+import os, sys, math, glob, platform, ctypes, ctypes.util, subprocess, re, random, threading, json, colorsys
 from PIL import Image
 from io import BytesIO
 
@@ -284,6 +284,7 @@ tray_globals = {
     'hwnd': None,
     'sleep_z': True,           # Show floating Z's while sleeping
     'soft_land': False,        # Play landing/wall-cling animations instead of bouncing
+    'cloak_color': 'default',  # Cloak hue: 'default' or '#RRGGBB'
 }
 
 # Global music state (modified by both main loop and tray)
@@ -479,8 +480,63 @@ def load_raw_assets():
     return raw_sprites, raw_seqs
 
 
+def _tint_cloak(surface, hex_color):
+    """Return a copy of surface with colored pixels' hue replaced by hex_color's hue.
+    Pixels that are near-black (outlines/skin) or near-white (mask) are left untouched."""
+    r_t = int(hex_color[1:3], 16) / 255.0
+    g_t = int(hex_color[3:5], 16) / 255.0
+    b_t = int(hex_color[5:7], 16) / 255.0
+    target_h, _, _ = colorsys.rgb_to_hsv(r_t, g_t, b_t)
+
+    arr_rgb   = pygame.surfarray.array3d(surface).astype(np.float32) / 255.0
+    arr_alpha = pygame.surfarray.array_alpha(surface)
+
+    r, g, b = arr_rgb[:, :, 0], arr_rgb[:, :, 1], arr_rgb[:, :, 2]
+    max_c = np.maximum(np.maximum(r, g), b)
+    min_c = np.minimum(np.minimum(r, g), b)
+    delta = max_c - min_c
+    v = max_c
+    s = np.where(max_c > 1e-6, delta / max_c, 0.0)
+
+    # Only recolor pixels that have actual chroma and are neither too dark nor too light
+    mask = (arr_alpha > 0) & (s > 0.10) & (v > 0.08) & (v < 0.97)
+
+    # Vectorized HSV→RGB using the fixed target hue
+    h6 = target_h * 6.0
+    hi = int(h6) % 6
+    f  = h6 - int(h6)
+    p  = v * (1.0 - s)
+    q  = v * (1.0 - f * s)
+    tv = v * (1.0 - (1.0 - f) * s)
+
+    rgb_cases = [
+        (v,  tv, p ),
+        (q,  v,  p ),
+        (p,  v,  tv),
+        (p,  q,  v ),
+        (tv, p,  v ),
+        (v,  p,  q ),
+    ]
+    nr, ng, nb = rgb_cases[hi]
+
+    out = (np.clip(np.stack([
+        np.where(mask, nr, r),
+        np.where(mask, ng, g),
+        np.where(mask, nb, b),
+    ], axis=-1), 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    new_surf = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+    pix = pygame.surfarray.pixels3d(new_surf)
+    pix[:] = out
+    del pix
+    alp = pygame.surfarray.pixels_alpha(new_surf)
+    alp[:] = arr_alpha
+    del alp
+    return new_surf
+
+
 def convert_assets(raw_sprites, raw_seqs):
-    """Convert raw surfaces to SRCALPHA with optional scaling."""
+    """Convert raw surfaces to SRCALPHA with optional scaling and cloak tint."""
     def _conv(s):
         s = s.convert_alpha()
         if SPRITE_SCALE != 1.0:
@@ -492,6 +548,8 @@ def convert_assets(raw_sprites, raw_seqs):
         alpha = pygame.surfarray.pixels_alpha(s)
         alpha[:] = np.where(alpha < 128, 0, 255)
         del alpha
+        if CLOAK_COLOR != 'default':
+            s = _tint_cloak(s, CLOAK_COLOR)
         return s
     sprites = {k: _conv(v) for k, v in raw_sprites.items()}
     seqs    = {k: [_conv(s) for s in v] for k, v in raw_seqs.items()}
@@ -1265,12 +1323,35 @@ _CONFIG_DEFAULTS = {
     'taunt_fps':      0.05,
     'taunt_cooldown': 120.0,
     'taunt_hover_time': 2.5,
+    'cloak_color': 'default',
 }
 
 SPRITE_SCALE     = 1.0    # set by load_config()
+CLOAK_COLOR      = 'default'  # set by load_config(); 'default' or '#RRGGBB'
 _raw_sprites     = None   # stored after load_raw_assets() so runtime rescale can re-convert
 _raw_seqs        = None
 _pending_rescale = False  # set True by load_config() when scale changes at runtime
+
+_CLOAK_PRESETS = [
+    ('Default', 'default'),
+    ('Red',     '#CC2233'),
+    ('Orange',  '#DD6622'),
+    ('Yellow',  '#CCAA11'),
+    ('Green',   '#22AA44'),
+    ('Teal',    '#22AAAA'),
+    ('Blue',    '#2255DD'),
+    ('Purple',  '#8833CC'),
+    ('Pink',    '#DD3399'),
+]
+
+def _set_cloak_color(hex_color):
+    """Set cloak color at runtime: update global, persist to config, trigger re-conversion."""
+    global CLOAK_COLOR, _pending_rescale
+    CLOAK_COLOR = hex_color
+    tray_globals['cloak_color'] = hex_color
+    _save_config_key('cloak_color', hex_color)
+    _pending_rescale = True
+
 
 def _save_config_key(key, value):
     """Persist a single key back to config.json without touching other values."""
@@ -1289,7 +1370,7 @@ def _save_config_key(key, value):
         print(f"[config] failed to save {key}: {e}")
 
 def load_config(apply_volume=False):
-    global FAST_FALL_VY, WRONG_MIX, ON_GROUND_TOL, SIT_Y_OFFSET, IDLE_Y_OFFSET, SLEEP_Y_OFFSET, SPRITE_SCALE, _pending_rescale
+    global FAST_FALL_VY, WRONG_MIX, ON_GROUND_TOL, SIT_Y_OFFSET, IDLE_Y_OFFSET, SLEEP_Y_OFFSET, SPRITE_SCALE, CLOAK_COLOR, _pending_rescale
     cfg = dict(_CONFIG_DEFAULTS)
     if os.path.exists(CONFIG_PATH):
         try:
@@ -1320,18 +1401,21 @@ def load_config(apply_volume=False):
     Hornet.TAUNT_COOLDOWN  = float(cfg['taunt_cooldown'])
     Hornet.TAUNT_HOVER_TIME = float(cfg['taunt_hover_time'])
     new_scale = max(0.1, float(cfg['scale']) / 100.0)
-    if apply_volume and abs(new_scale - SPRITE_SCALE) > 1e-6:
+    new_cloak = str(cfg['cloak_color'])
+    if apply_volume and (abs(new_scale - SPRITE_SCALE) > 1e-6 or new_cloak != CLOAK_COLOR):
         _pending_rescale = True
     SPRITE_SCALE = new_scale
+    CLOAK_COLOR  = new_cloak
     FAST_FALL_VY  = float(cfg['fast_fall_vy'])
     WRONG_MIX     = float(cfg['wrong_mix'])
     ON_GROUND_TOL = int(cfg['on_ground_tol'])
     SIT_Y_OFFSET   = float(cfg['sit_y_offset'])
     IDLE_Y_OFFSET  = float(cfg['idle_y_offset'])
     SLEEP_Y_OFFSET = float(cfg['sleep_y_offset'])
-    tray_globals['volume']    = float(cfg['volume'])
-    tray_globals['sleep_z']   = bool(cfg['sleep_z'])
-    tray_globals['soft_land'] = bool(cfg['soft_land'])
+    tray_globals['volume']      = float(cfg['volume'])
+    tray_globals['sleep_z']     = bool(cfg['sleep_z'])
+    tray_globals['soft_land']   = bool(cfg['soft_land'])
+    tray_globals['cloak_color'] = CLOAK_COLOR
     if apply_volume:
         try:
             pygame.mixer.music.set_volume(tray_globals['volume'])
@@ -1418,13 +1502,44 @@ def _create_tray_icon(hwnd, hornet_ref):
         tray_globals['soft_land'] = not tray_globals['soft_land']
         _save_config_key('soft_land', tray_globals['soft_land'])
 
+    def on_cloak_preset(color_val):
+        def handler(icon=None, item=None):
+            _set_cloak_color(color_val)
+        return handler
+
+    def on_cloak_custom(icon=None, item=None):
+        def _pick():
+            try:
+                import tkinter as tk
+                import tkinter.colorchooser as cc
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes('-topmost', True)
+                init = tray_globals['cloak_color'] if tray_globals['cloak_color'] != 'default' else '#8833CC'
+                result = cc.askcolor(color=init, title='Cloak Color', parent=root)
+                root.destroy()
+                if result and result[1]:
+                    _set_cloak_color(result[1].upper())
+            except Exception as e:
+                print(f"[tray] color picker error: {e}")
+        threading.Thread(target=_pick, daemon=True).start()
+
     volume_items = [MenuItem(f'{int(v*100)}%', on_volume(v)) for v in [0.0,0.25,0.5,0.75,1.0]]
     song_items   = [MenuItem('Random', on_song(-1))] + [MenuItem(SONG_NAMES[i], on_song(i)) for i in range(len(SONG_NAMES))]
+
+    def _cloak_checked(val):
+        return lambda item: tray_globals.get('cloak_color', 'default') == val
+
+    cloak_items = [
+        MenuItem(label, on_cloak_preset(val), checked=_cloak_checked(val), radio=True)
+        for label, val in _CLOAK_PRESETS
+    ] + [MenuItem('Custom…', on_cloak_custom)]
 
     def build_menu():
         return Menu(
             MenuItem('Songs', Menu(*song_items)),
             MenuItem('Volume', Menu(*volume_items)),
+            MenuItem('Cloak Color', Menu(*cloak_items)),
             MenuItem('Sleep Z\'s', on_toggle_sleep_z,
                      checked=lambda item: tray_globals['sleep_z']),
             MenuItem('Soft Landing', on_toggle_soft_land,
@@ -1523,11 +1638,16 @@ def _create_tray_icon_sni(hornet_ref):
         tray_globals['soft_land'] = not tray_globals['soft_land']
         _save_config_key('soft_land', tray_globals['soft_land'])
 
+    def on_cloak_preset_cb(val):
+        def cb(): _set_cloak_color(val)
+        return cb
+
     # ── Tkinter popup menu ─────────────────────────────────────────────────────
     def show_menu(x, y):
         def _run():
             try:
                 import tkinter as tk
+                import tkinter.colorchooser as cc
                 root = tk.Tk()
                 root.withdraw()
                 root.attributes('-topmost', True)
@@ -1538,6 +1658,22 @@ def _create_tray_icon_sni(hornet_ref):
                         try: cb()
                         except Exception: pass
                     return inner
+
+                def open_color_picker():
+                    root.after(50, root.destroy)
+                    def _pick():
+                        try:
+                            r2 = tk.Tk()
+                            r2.withdraw()
+                            r2.attributes('-topmost', True)
+                            init = tray_globals['cloak_color'] if tray_globals['cloak_color'] != 'default' else '#8833CC'
+                            result = cc.askcolor(color=init, title='Cloak Color', parent=r2)
+                            r2.destroy()
+                            if result and result[1]:
+                                _set_cloak_color(result[1].upper())
+                        except Exception as e:
+                            print(f"[tray] color picker error: {e}")
+                    threading.Thread(target=_pick, daemon=True).start()
 
                 pop = tk.Menu(root, tearoff=0)
 
@@ -1551,6 +1687,16 @@ def _create_tray_icon_sni(hornet_ref):
                 for v in [0.0, 0.25, 0.5, 0.75, 1.0]:
                     vm.add_command(label=f'{int(v*100)}%', command=close_run(on_vol_cb(v)))
                 pop.add_cascade(label='Volume', menu=vm)
+
+                cm = tk.Menu(pop, tearoff=0)
+                cur_cloak = tray_globals.get('cloak_color', 'default')
+                cloak_var = tk.StringVar(value=cur_cloak)
+                for label, val in _CLOAK_PRESETS:
+                    cm.add_radiobutton(label=label, value=val, variable=cloak_var,
+                                       command=close_run(on_cloak_preset_cb(val)))
+                cm.add_separator()
+                cm.add_command(label='Custom…', command=open_color_picker)
+                pop.add_cascade(label='Cloak Color', menu=cm)
 
                 pop.add_separator()
                 sleep_z_var = tk.BooleanVar(value=tray_globals['sleep_z'])

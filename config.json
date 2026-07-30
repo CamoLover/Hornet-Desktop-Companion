@@ -21,5 +21,6 @@
     "soft_land": false,
     "taunt_fps": 0.06,
     "taunt_cooldown": 120.0,
-    "taunt_hover_time": 2.5
+    "taunt_hover_time": 2.5,
+    "cloak_color": "default"
 }
