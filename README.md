@@ -32,6 +32,8 @@
 - **Click-through** -  window is invisible to mouse clicks when not hovering (Windows)
 - **Pixel-perfect transparency** -  no black box; uses the SHAPE extension on Linux or layered windows on Windows
 - **Throwable** -  drag and release with momentum to fling her
+- **Cloak recoloring** -  choose from color presets or a custom hex color for Hornet's cloak, from the tray icon
+- **Spawn animation** -  choose whether Hornet falls in from the top or walks in from the left/right edge of the screen on launch
 
 ---
 
@@ -146,11 +148,19 @@ Right-click (Windows) or click (Linux) the tray icon to access:
 | **Songs → Random** | Pick a random Needoline segment each time she sits |
 | **Songs → [name]** | Lock to a specific segment |
 | **Volume → 0–100%** | Set playback volume |
+| **Cloak Color → [preset]** | Recolor Hornet's cloak; takes effect immediately |
+| **Cloak Color → Custom…** | Pick any color via a color picker dialog |
+| **Spawn Mode → Fall (Default)** | Hornet drops in from the top on launch |
+| **Spawn Mode → Walk from Right / Left** | Hornet walks in from the chosen screen edge on launch |
 | **Reload Config** | Hot-reload `config.json` -  applies all values instantly, including scale |
 | **Reset Topmost** | Force the window back to the top of the z-order (Windows only) |
 | **Quit** | Close the companion |
 
 Available songs: Default Melody, Beastling Call, Elegy of the Deep, Conductor Melody, Vaultkeeper Melody, Architect Melody, Trial End.
+
+Available cloak presets: Default, Red, Orange, Yellow, Green, Teal, Blue, Purple, Pink -  or any custom hex color.
+
+> Spawn mode is saved to `config.json` and applies the next time the companion is launched.
 
 ---
 
@@ -183,6 +193,8 @@ All values hot-reload instantly via **Tray → Reload Config**.
 | `taunt_fps` | `0.06` | Seconds per frame for the taunt animation |
 | `taunt_cooldown` | `120.0` | Seconds before Hornet can be taunted again |
 | `taunt_hover_time` | `2.5` | Seconds the cursor must hover near Hornet to trigger a taunt |
+| `cloak_color` | `"default"` | Cloak hue -  `"default"` or a `"#RRGGBB"` hex string |
+| `spawn_mode` | `"fall"` | How Hornet enters on launch -  `"fall"`, `"walk_from_right"`, or `"walk_from_left"` |
 
 ---
 
@@ -205,6 +217,9 @@ All values hot-reload instantly via **Tray → Reload Config**.
 | `assets/sprites/wall_slide/` | Wall-slide animation (9 frames) |
 | `assets/sprites/wall_cling/` | Wall-cling animation (4 frames) |
 | `assets/sprites/taunt/` | Taunt animation (19 frames + 8-frame silk effect) |
+| `assets/sprites/sleep_wake/` | Sleep / wake transition (14 frames, played forward and reversed) |
+| `assets/sprites/walk/` | Walk-in entrance animation (10 frames) |
+| `assets/sprites/walk_stop/` | Walk-in stop transition (5 frames) |
 | `assets/audio/needoline.mp3` | Background music track |
 | `assets/logo/` | App icon (PNG + ICO) |
 
