@@ -201,9 +201,53 @@ def _find_argb_visual():
         return None
 
 
+def _win_enum_monitors():
+    """Per-monitor bounds via EnumDisplayMonitors, in virtual-desktop coordinates
+    (origin may be negative when a monitor sits left of / above the primary one).
+    Returns a list of (mon_left, mon_top, mon_right, mon_bottom,
+                        work_left, work_top, work_right, work_bottom) tuples."""
+    import ctypes.wintypes as wt
+
+    class _MONITORINFO(ctypes.Structure):
+        _fields_ = [('cbSize', ctypes.c_uint32), ('rcMonitor', wt.RECT),
+                    ('rcWork', wt.RECT), ('dwFlags', ctypes.c_uint32)]
+
+    monitors = []
+    MonitorEnumProc = ctypes.WINFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.POINTER(wt.RECT), wt.LPARAM)
+
+    def _cb(hmon, hdc, lprc, data):
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            monitors.append((
+                mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom,
+                mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom,
+            ))
+        return 1
+
+    try:
+        u32 = ctypes.windll.user32
+        u32.EnumDisplayMonitors.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                             MonitorEnumProc, wt.LPARAM]
+        u32.EnumDisplayMonitors.restype = ctypes.c_int
+        u32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
+        u32.GetMonitorInfoW.restype = ctypes.c_int
+        u32.EnumDisplayMonitors(None, None, MonitorEnumProc(_cb), 0)
+    except Exception:
+        pass
+    return monitors
+
+
 SCREEN_W = SCREEN_H = 0
 USABLE_H = 0           # bottom of work area (where taskbar starts)
 ARGB_MODE = False
+# Full virtual desktop (spans every monitor). VIRT_LEFT/TOP can be negative
+# when a monitor is positioned left of / above the primary one.
+VIRT_LEFT = VIRT_TOP = 0
+VIRT_W = VIRT_H = 0
+MONITORS = []           # list of per-monitor bound tuples, see _win_enum_monitors()
 
 if PLAT == 'Linux':
     # --- screen size (physical pixels, not DPI-scaled) ---
@@ -224,13 +268,21 @@ if PLAT == 'Linux':
 
 elif PLAT == 'Windows':
     import ctypes.wintypes as _wt
-    # Physical screen size
+    # Physical screen size (primary monitor -  used to center the sprite at startup)
     SCREEN_W = ctypes.windll.user32.GetSystemMetrics(0)   # SM_CXSCREEN
     SCREEN_H = ctypes.windll.user32.GetSystemMetrics(1)   # SM_CYSCREEN
     # Work area bottom = where taskbar starts (SPI_GETWORKAREA = 48)
     _rc = _wt.RECT()
     ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(_rc), 0)
     USABLE_H = _rc.bottom
+
+    # Full virtual desktop bounds (spans every monitor) + per-monitor work areas,
+    # so physics (floor/walls) can span and react correctly across all screens.
+    VIRT_LEFT = ctypes.windll.user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+    VIRT_TOP  = ctypes.windll.user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+    VIRT_W    = ctypes.windll.user32.GetSystemMetrics(78) or SCREEN_W  # SM_CXVIRTUALSCREEN
+    VIRT_H    = ctypes.windll.user32.GetSystemMetrics(79) or SCREEN_H  # SM_CYVIRTUALSCREEN
+    MONITORS  = _win_enum_monitors()
 
 os.environ.setdefault('SDL_VIDEO_WINDOW_POS', '0,0')
 
@@ -585,9 +637,21 @@ class Hornet:
     _z_font      = None
     _z_font_size = 0
 
-    def __init__(self, x, y, sprites, seqs, floor_y):
+    def __init__(self, x, y, sprites, seqs, floor_y,
+                 monitors=None, world_left=0.0, world_w=0.0, world_top=0.0):
         self.x = float(x);  self.y = float(y)
         self.vx = 0.0;      self.vy = 0.0
+
+        # Multi-monitor physics bounds: `monitors` is a list of per-monitor
+        # (mon_left, mon_top, mon_right, mon_bottom, work_left, work_top,
+        #  work_right, work_bottom) tuples used to pick the correct floor
+        # (taskbar height) for whichever monitor she's currently over.
+        # world_left/world_w/world_top bound the combined desktop for
+        # left/right/top wall bounces.
+        self.monitors   = monitors or []
+        self.world_left = float(world_left)
+        self.world_w    = float(world_w)
+        self.world_top  = float(world_top)
 
         self.sprites            = sprites
         self.idle_frames        = seqs['idle']
@@ -710,6 +774,21 @@ class Hornet:
 
     def is_on_ground(self) -> bool:
         return self.y >= self.floor_y - ON_GROUND_TOL and abs(self.vy) < 60
+
+    def _floor_for_x(self, cx) -> float:
+        """Work-area bottom (minus sprite height) of whichever monitor sits under x=cx.
+        Falls back to the nearest monitor by edge distance if cx is over a gap."""
+        if not self.monitors:
+            return self.floor_y
+        idle_h = self._idle_h
+        best_wb = None
+        best_dist = None
+        for (ml, mt, mr, mb, wl, wt, wr, wb) in self.monitors:
+            dist = 0.0 if ml <= cx <= mr else min(abs(cx - ml), abs(cx - mr))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_wb = wb
+        return float(best_wb - idle_h)
 
     # ── events ────────────────────────────────────────────────────────────────
     def mouse_down(self, mx, my):
@@ -901,8 +980,9 @@ class Hornet:
         self._update_z_particles(dt)
 
     # ── landing / wall-cling state machine ────────────────────────────────────
-    def _update_land(self, dt, screen_w):
+    def _update_land(self, dt):
         p = self.land_phase
+        world_right = self.world_left + self.world_w
 
         if p == 'land':
             self.land_timer += dt
@@ -914,7 +994,7 @@ class Hornet:
 
         elif p == 'wall_cling':
             if self.wall_side == 'right':
-                self.x = float(screen_w - self.wall_cling_frames[self.land_idx].get_width())
+                self.x = float(world_right - self.wall_cling_frames[self.land_idx].get_width())
             self.land_timer += dt
             if self.land_timer >= self.LAND_FPS:
                 self.land_timer = 0.0
@@ -931,24 +1011,27 @@ class Hornet:
             self.y  += self.vy * dt
             # Keep her pinned to the wall she clung to
             if self.wall_side == 'left':
-                self.x = 0.0
+                self.x = self.world_left
             else:
-                self.x = float(screen_w - self.wall_slide_frames[self.land_idx].get_width())
+                self.x = float(world_right - self.wall_slide_frames[self.land_idx].get_width())
             # Advance animation (clamp at last frame)
             self.land_timer += dt
             if self.land_timer >= self.WALL_SLIDE_FPS:
                 self.land_timer = 0.0
                 if self.land_idx < len(self.wall_slide_frames) - 1:
                     self.land_idx += 1
+            # Floor under the wall she's clinging to (recomputed each tick in
+            # case monitors of different heights meet at this world edge)
+            self.floor_y = self._floor_for_x(self.x + self._idle_w / 2)
             # Transition to wall_land when she reaches the floor
             if self.y >= self.floor_y:
                 self.y = self.floor_y
                 self.vy = 0.0
                 # Snap x back to the idle-width boundary so wake frames align with idle
                 if self.wall_side == 'right':
-                    self.x = float(screen_w - self._idle_w)
+                    self.x = float(world_right - self._idle_w)
                 else:
-                    self.x = 0.0
+                    self.x = self.world_left
                 self.facing_right = (self.wall_side == 'right')
                 self.land_phase = 'wall_land'
                 self.land_idx   = 0
@@ -1066,10 +1149,16 @@ class Hornet:
         surface.blit(silk_raw, (sx, sy))
 
     # ── physics ───────────────────────────────────────────────────────────────
-    def update(self, dt, screen_w, mx=None, my=None):
+    def update(self, dt, mx=None, my=None):
+        world_right = self.world_left + self.world_w
+
         # Tick cooldown regardless of state
         if self.taunt_cooldown_timer > 0:
             self.taunt_cooldown_timer -= dt
+
+        # Refresh floor for whichever monitor sits under her right now
+        if self.monitors:
+            self.floor_y = self._floor_for_x(self.x + self._idle_w / 2)
 
         if self.sleeping:
             self._update_sleep(dt)
@@ -1091,7 +1180,7 @@ class Hornet:
             self._update_sit(dt)
             return
         if self.land_phase is not None:
-            self._update_land(dt, screen_w)
+            self._update_land(dt)
             return
         self.idle_timer += dt
         if self.idle_timer >= self.IDLE_FPS:
@@ -1144,8 +1233,8 @@ class Hornet:
                 self.vx *= self.FRICTION
                 if abs(self.vy) < self.MIN_BOUNCE_VY:
                     self.vy = 0.0
-        if self.x < 0:
-            self.x = 0.0
+        if self.x < self.world_left:
+            self.x = self.world_left
             if soft and abs(self.vx) * self.BOUNCE_DAMP >= 50.0:
                 self.vx         = 0.0
                 self.vy         = 0.0
@@ -1156,7 +1245,7 @@ class Hornet:
                 self.land_timer = 0.0
             else:
                 self.vx = abs(self.vx) * self.BOUNCE_DAMP
-        elif self.x > screen_w - self._idle_w:
+        elif self.x > world_right - self._idle_w:
             if soft and abs(self.vx) * self.BOUNCE_DAMP >= 50.0:
                 self.vx         = 0.0
                 self.vy         = 0.0
@@ -1165,12 +1254,12 @@ class Hornet:
                 self.land_phase = 'wall_cling'
                 self.land_idx   = 0
                 self.land_timer = 0.0
-                self.x = float(screen_w - self.wall_cling_frames[0].get_width())
+                self.x = float(world_right - self.wall_cling_frames[0].get_width())
             else:
-                self.x  = float(screen_w - self._idle_w)
+                self.x  = float(world_right - self._idle_w)
                 self.vx = -abs(self.vx) * self.BOUNCE_DAMP
-        if self.y < 0:
-            self.y  = 0.0;  self.vy = abs(self.vy) * self.BOUNCE_DAMP
+        if self.y < self.world_top:
+            self.y  = self.world_top;  self.vy = abs(self.vy) * self.BOUNCE_DAMP
         self._upd_state()
 
     # ── draw ──────────────────────────────────────────────────────────────────
@@ -1784,6 +1873,15 @@ def main():
 
     usable_h = USABLE_H if USABLE_H else screen_h
 
+    # Multi-monitor bounds. On Windows these are already populated with real
+    # per-monitor data; everywhere else, treat the whole (already-multi-monitor
+    # on Linux, via xrandr) screen as a single synthetic monitor.
+    global MONITORS, VIRT_LEFT, VIRT_TOP, VIRT_W, VIRT_H
+    if not MONITORS:
+        MONITORS = [(0, 0, screen_w, screen_h, 0, 0, screen_w, usable_h)]
+    if not VIRT_W:
+        VIRT_LEFT, VIRT_TOP, VIRT_W, VIRT_H = 0, 0, screen_w, screen_h
+
     # Load raw sprites before set_mode so we know sizes for the Windows window
     global _raw_sprites, _raw_seqs
     raw_sprites, raw_seqs = load_raw_assets()
@@ -1857,6 +1955,10 @@ def main():
         sprites = sprites,
         seqs    = seqs,
         floor_y = floor_y,
+        monitors   = MONITORS,
+        world_left = float(VIRT_LEFT),
+        world_w    = float(VIRT_W),
+        world_top  = float(VIRT_TOP),
     )
     hornet.vy = 120.0
 
@@ -1938,7 +2040,7 @@ def main():
             elif event.type == pygame.MOUSEMOTION:
                 hornet.mouse_move(mx, my, dt)
 
-        hornet.update(dt, screen_w, mx, my)
+        hornet.update(dt, mx, my)
 
         # Consume sit animation events
         if hornet.ev_music_start:
@@ -1981,7 +2083,7 @@ def main():
             hornet.taunt_frames      = new_seqs['taunt']
             hornet.taunt_silk_frames = new_seqs['taunt_silk']
             old_floor_y    = hornet.floor_y
-            hornet.floor_y = float(usable_h - new_seqs['idle'][0].get_height())
+            hornet.floor_y = hornet._floor_for_x(hornet.x + hornet._idle_w / 2)
             hornet.y      += hornet.floor_y - old_floor_y
             # Stale particle positions are meaningless after a rescale
             hornet.z_particles  = []
