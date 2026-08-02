@@ -537,12 +537,15 @@ def load_raw_assets():
 
 
 def _tint_cloak(surface, hex_color):
-    """Return a copy of surface with colored pixels' hue replaced by hex_color's hue.
+    """Return a copy of surface with colored pixels recolored towards hex_color:
+    hue is replaced outright, saturation/value are blended towards the target's so
+    that grayscale targets (black/white) actually darken/lighten the cloak instead
+    of being ignored (hue is meaningless for zero-saturation colors).
     Pixels that are near-black (outlines/skin) or near-white (mask) are left untouched."""
     r_t = int(hex_color[1:3], 16) / 255.0
     g_t = int(hex_color[3:5], 16) / 255.0
     b_t = int(hex_color[5:7], 16) / 255.0
-    target_h, _, _ = colorsys.rgb_to_hsv(r_t, g_t, b_t)
+    target_h, target_s, target_v = colorsys.rgb_to_hsv(r_t, g_t, b_t)
 
     arr_rgb   = pygame.surfarray.array3d(surface).astype(np.float32) / 255.0
     arr_alpha = pygame.surfarray.array_alpha(surface)
@@ -557,21 +560,27 @@ def _tint_cloak(surface, hex_color):
     # Only recolor pixels that have actual chroma and are neither too dark nor too light
     mask = (arr_alpha > 0) & (s > 0.10) & (v > 0.08) & (v < 0.97)
 
-    # Vectorized HSV→RGB using the fixed target hue
+    # Saturation follows the target exactly (so black/white targets end up neutral
+    # gray instead of tinted), value blends towards the target while keeping some
+    # of the original shading contrast (highlights/shadows).
+    ns = target_s
+    nv = v * 0.45 + target_v * 0.55
+
+    # Vectorized HSV→RGB using the fixed target hue and blended saturation/value
     h6 = target_h * 6.0
     hi = int(h6) % 6
     f  = h6 - int(h6)
-    p  = v * (1.0 - s)
-    q  = v * (1.0 - f * s)
-    tv = v * (1.0 - (1.0 - f) * s)
+    p  = nv * (1.0 - ns)
+    q  = nv * (1.0 - f * ns)
+    tv = nv * (1.0 - (1.0 - f) * ns)
 
     rgb_cases = [
-        (v,  tv, p ),
-        (q,  v,  p ),
-        (p,  v,  tv),
-        (p,  q,  v ),
-        (tv, p,  v ),
-        (v,  p,  q ),
+        (nv, tv, p ),
+        (q,  nv, p ),
+        (p,  nv, tv),
+        (p,  q,  nv),
+        (tv, p,  nv),
+        (nv, p,  q ),
     ]
     nr, ng, nb = rgb_cases[hi]
 
@@ -1516,6 +1525,8 @@ _CLOAK_PRESETS = [
     ('Blue',    '#2255DD'),
     ('Purple',  '#8833CC'),
     ('Pink',    '#DD3399'),
+    ('Black',   '#000000'),
+    ('White',   '#FFFFFF'),
 ]
 
 def _set_cloak_color(hex_color):
