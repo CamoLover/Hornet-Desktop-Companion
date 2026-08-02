@@ -1626,6 +1626,149 @@ def render_argb(screen, offscreen, hornet):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Shared right-click context menu (tkinter popup)
+# Used both by the Linux SNI tray and by right-clicking Hornet herself.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _show_context_menu(x, y, hornet_ref, on_quit=None):
+    """Pop up a tkinter context menu at (x, y) mirroring the tray icon's menu.
+    Runs in its own thread since tkinter needs its own mainloop.
+    `on_quit`, if given, replaces the default quit handler (e.g. the Linux SNI
+    tray also needs to stop its D-Bus loop)."""
+    def _run():
+        try:
+            import tkinter as tk
+            import tkinter.colorchooser as cc
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+
+            def close_run(cb):
+                def inner():
+                    root.after(50, root.destroy)
+                    try: cb()
+                    except Exception: pass
+                return inner
+
+            def on_song(idx):
+                def cb():
+                    if idx == -1:
+                        tray_globals['auto_random_song'] = True
+                        tray_globals['current_song'] = -1
+                    else:
+                        tray_globals['current_song'] = idx
+                        tray_globals['auto_random_song'] = False
+                    if hornet_ref[0] and hornet_ref[0].sitting:
+                        start_song_from_tray(idx if idx >= 0 else random.randrange(len(NEEDOLINE_SEGMENTS)))
+                return cb
+
+            def on_vol(vol):
+                def cb():
+                    tray_globals['volume'] = vol
+                    pygame.mixer.music.set_volume(vol)
+                    _save_config_key('volume', vol)
+                return cb
+
+            def on_cloak_preset(val):
+                def cb(): _set_cloak_color(val)
+                return cb
+
+            def on_spawn_mode(val):
+                def cb(): _set_spawn_mode(val)
+                return cb
+
+            def on_toggle_sleep_z():
+                tray_globals['sleep_z'] = not tray_globals['sleep_z']
+                if not tray_globals['sleep_z'] and hornet_ref[0]:
+                    hornet_ref[0].z_particles  = []
+                    hornet_ref[0].z_spawn_timer = 0.0
+                _save_config_key('sleep_z', tray_globals['sleep_z'])
+
+            def on_toggle_soft_land():
+                tray_globals['soft_land'] = not tray_globals['soft_land']
+                _save_config_key('soft_land', tray_globals['soft_land'])
+
+            def on_reload_config():
+                load_config(apply_volume=True)
+
+            def on_reset_topmost():
+                h = tray_globals.get('hwnd')
+                if h:
+                    _win_assert_topmost(h)
+
+            def on_quit_default():
+                tray_globals['running'] = False
+
+            def open_color_picker():
+                root.after(50, root.destroy)
+                def _pick():
+                    try:
+                        r2 = tk.Tk()
+                        r2.withdraw()
+                        r2.attributes('-topmost', True)
+                        init = tray_globals['cloak_color'] if tray_globals['cloak_color'] != 'default' else '#8833CC'
+                        result = cc.askcolor(color=init, title='Cloak Color', parent=r2)
+                        r2.destroy()
+                        if result and result[1]:
+                            _set_cloak_color(result[1].upper())
+                    except Exception as e:
+                        print(f"[menu] color picker error: {e}")
+                threading.Thread(target=_pick, daemon=True).start()
+
+            pop = tk.Menu(root, tearoff=0)
+
+            sm = tk.Menu(pop, tearoff=0)
+            sm.add_command(label='Random', command=close_run(on_song(-1)))
+            for i, n in enumerate(SONG_NAMES):
+                sm.add_command(label=n, command=close_run(on_song(i)))
+            pop.add_cascade(label='Songs', menu=sm)
+
+            vm = tk.Menu(pop, tearoff=0)
+            for v in [0.0, 0.25, 0.5, 0.75, 1.0]:
+                vm.add_command(label=f'{int(v*100)}%', command=close_run(on_vol(v)))
+            pop.add_cascade(label='Volume', menu=vm)
+
+            cm = tk.Menu(pop, tearoff=0)
+            cur_cloak = tray_globals.get('cloak_color', 'default')
+            cloak_var = tk.StringVar(value=cur_cloak)
+            for label, val in _CLOAK_PRESETS:
+                cm.add_radiobutton(label=label, value=val, variable=cloak_var,
+                                   command=close_run(on_cloak_preset(val)))
+            cm.add_separator()
+            cm.add_command(label='Custom…', command=open_color_picker)
+            pop.add_cascade(label='Cloak Color', menu=cm)
+
+            spm = tk.Menu(pop, tearoff=0)
+            cur_spawn = tray_globals.get('spawn_mode', 'fall')
+            spawn_var = tk.StringVar(value=cur_spawn)
+            for label, val in (('Fall (Default)', 'fall'),
+                                ('Walk from Right', 'walk_from_right'),
+                                ('Walk from Left', 'walk_from_left')):
+                spm.add_radiobutton(label=label, value=val, variable=spawn_var,
+                                    command=close_run(on_spawn_mode(val)))
+            pop.add_cascade(label='Spawn Mode', menu=spm)
+
+            pop.add_separator()
+            sleep_z_var = tk.BooleanVar(value=tray_globals['sleep_z'])
+            pop.add_checkbutton(label="Sleep Z's", variable=sleep_z_var,
+                                command=close_run(on_toggle_sleep_z))
+            soft_land_var = tk.BooleanVar(value=tray_globals['soft_land'])
+            pop.add_checkbutton(label='Soft Landing', variable=soft_land_var,
+                                command=close_run(on_toggle_soft_land))
+            pop.add_separator()
+            pop.add_command(label='Reload Config', command=close_run(on_reload_config))
+            if PLAT == 'Windows':
+                pop.add_command(label='Reset Topmost', command=close_run(on_reset_topmost))
+            pop.add_command(label='Quit', command=close_run(on_quit or on_quit_default))
+            pop.bind('<Unmap>', lambda e: root.after(150, root.destroy))
+            root.after(0, lambda: pop.tk_popup(x, y, 0))
+            root.mainloop()
+        except Exception as e:
+            print(f"[menu] context menu error: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tray Icon (Windows only)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1803,135 +1946,15 @@ def _create_tray_icon_sni(hornet_ref):
 
     _sni_ref = [None]
 
-    # ── Callbacks ──────────────────────────────────────────────────────────────
-    def on_song_cb(idx):
-        def cb():
-            if idx == -1:
-                tray_globals['auto_random_song'] = True
-                tray_globals['current_song'] = -1
-            else:
-                tray_globals['current_song'] = idx
-                tray_globals['auto_random_song'] = False
-            if hornet_ref[0] and hornet_ref[0].sitting:
-                start_song_from_tray(idx if idx >= 0 else random.randrange(len(NEEDOLINE_SEGMENTS)))
-        return cb
-
-    def on_vol_cb(vol):
-        def cb():
-            tray_globals['volume'] = vol
-            pygame.mixer.music.set_volume(vol)
-            _save_config_key('volume', vol)
-        return cb
-
     def on_quit_cb():
         tray_globals['running'] = False
         if _sni_ref[0]:
             _sni_ref[0].stop()
 
-    def on_reload_config_cb():
-        load_config(apply_volume=True)
-
-    def on_toggle_sleep_z_cb():
-        tray_globals['sleep_z'] = not tray_globals['sleep_z']
-        if not tray_globals['sleep_z'] and hornet_ref[0]:
-            hornet_ref[0].z_particles  = []
-            hornet_ref[0].z_spawn_timer = 0.0
-        _save_config_key('sleep_z', tray_globals['sleep_z'])
-
-    def on_toggle_soft_land_cb():
-        tray_globals['soft_land'] = not tray_globals['soft_land']
-        _save_config_key('soft_land', tray_globals['soft_land'])
-
-    def on_cloak_preset_cb(val):
-        def cb(): _set_cloak_color(val)
-        return cb
-
-    def on_spawn_mode_cb(val):
-        def cb(): _set_spawn_mode(val)
-        return cb
-
-    # ── Tkinter popup menu ─────────────────────────────────────────────────────
+    # Menu content lives in the shared _show_context_menu (also used by
+    # right-clicking Hornet herself); only quitting needs SNI-specific cleanup.
     def show_menu(x, y):
-        def _run():
-            try:
-                import tkinter as tk
-                import tkinter.colorchooser as cc
-                root = tk.Tk()
-                root.withdraw()
-                root.attributes('-topmost', True)
-
-                def close_run(cb):
-                    def inner():
-                        root.after(50, root.destroy)
-                        try: cb()
-                        except Exception: pass
-                    return inner
-
-                def open_color_picker():
-                    root.after(50, root.destroy)
-                    def _pick():
-                        try:
-                            r2 = tk.Tk()
-                            r2.withdraw()
-                            r2.attributes('-topmost', True)
-                            init = tray_globals['cloak_color'] if tray_globals['cloak_color'] != 'default' else '#8833CC'
-                            result = cc.askcolor(color=init, title='Cloak Color', parent=r2)
-                            r2.destroy()
-                            if result and result[1]:
-                                _set_cloak_color(result[1].upper())
-                        except Exception as e:
-                            print(f"[tray] color picker error: {e}")
-                    threading.Thread(target=_pick, daemon=True).start()
-
-                pop = tk.Menu(root, tearoff=0)
-
-                sm = tk.Menu(pop, tearoff=0)
-                sm.add_command(label='Random', command=close_run(on_song_cb(-1)))
-                for i, n in enumerate(SONG_NAMES):
-                    sm.add_command(label=n, command=close_run(on_song_cb(i)))
-                pop.add_cascade(label='Songs', menu=sm)
-
-                vm = tk.Menu(pop, tearoff=0)
-                for v in [0.0, 0.25, 0.5, 0.75, 1.0]:
-                    vm.add_command(label=f'{int(v*100)}%', command=close_run(on_vol_cb(v)))
-                pop.add_cascade(label='Volume', menu=vm)
-
-                cm = tk.Menu(pop, tearoff=0)
-                cur_cloak = tray_globals.get('cloak_color', 'default')
-                cloak_var = tk.StringVar(value=cur_cloak)
-                for label, val in _CLOAK_PRESETS:
-                    cm.add_radiobutton(label=label, value=val, variable=cloak_var,
-                                       command=close_run(on_cloak_preset_cb(val)))
-                cm.add_separator()
-                cm.add_command(label='Custom…', command=open_color_picker)
-                pop.add_cascade(label='Cloak Color', menu=cm)
-
-                spm = tk.Menu(pop, tearoff=0)
-                cur_spawn = tray_globals.get('spawn_mode', 'fall')
-                spawn_var = tk.StringVar(value=cur_spawn)
-                for label, val in (('Fall (Default)', 'fall'),
-                                    ('Walk from Right', 'walk_from_right'),
-                                    ('Walk from Left', 'walk_from_left')):
-                    spm.add_radiobutton(label=label, value=val, variable=spawn_var,
-                                        command=close_run(on_spawn_mode_cb(val)))
-                pop.add_cascade(label='Spawn Mode', menu=spm)
-
-                pop.add_separator()
-                sleep_z_var = tk.BooleanVar(value=tray_globals['sleep_z'])
-                pop.add_checkbutton(label="Sleep Z's", variable=sleep_z_var,
-                                    command=close_run(on_toggle_sleep_z_cb))
-                soft_land_var = tk.BooleanVar(value=tray_globals['soft_land'])
-                pop.add_checkbutton(label='Soft Landing', variable=soft_land_var,
-                                    command=close_run(on_toggle_soft_land_cb))
-                pop.add_separator()
-                pop.add_command(label='Reload Config', command=close_run(on_reload_config_cb))
-                pop.add_command(label='Quit', command=close_run(on_quit_cb))
-                pop.bind('<Unmap>', lambda e: root.after(150, root.destroy))
-                root.after(0, lambda: pop.tk_popup(x, y, 0))
-                root.mainloop()
-            except Exception as e:
-                print(f"[tray] menu error: {e}")
-        threading.Thread(target=_run, daemon=True).start()
+        _show_context_menu(x, y, hornet_ref, on_quit=on_quit_cb)
 
     # ── Icon pixmap (SNI ARGB32 big-endian format) ─────────────────────────────
     def build_pixmap(size=22):
@@ -2327,6 +2350,9 @@ def main():
                 hornet.mouse_down(mx, my)
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 hornet.mouse_up(mx, my)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+                if hornet.is_clicked(mx, my):
+                    _show_context_menu(mx, my, hornet_ref)
             elif event.type == pygame.MOUSEMOTION:
                 hornet.mouse_move(mx, my, dt)
 
