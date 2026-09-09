@@ -708,6 +708,12 @@ class Hornet:
     WALK_STOP_FPS  = 0.08   # seconds per frame for the walk-in stop animation
     WALK_SPEED     = 240.0  # px/sec while walking on-screen at the entrance
 
+    # Grab-swing pendulum: sprite pivots around the grip point while dragged.
+    DRAG_SWING_DAMPING   = 0.16    # damping ratio; <1 = oscillates before settling
+    DRAG_SWING_IMPULSE_K = 0.0022  # rad/s of ang-vel per (px/s) of pivot-accel impulse
+    DRAG_SWING_MAX_DEG   = 60.0    # cap angle so the sprite never flips upside-down
+    DRAG_SWING_MAX_DVX   = 3500.0  # px/s cap on per-frame velocity delta (spike guard)
+
     _z_font      = None
     _z_font_size = 0
 
@@ -795,6 +801,14 @@ class Hornet:
         self._off_x    = 0.0; self._off_y   = 0.0
         self._mvx      = 0.0; self._mvy     = 0.0
         self._last_mx  = 0;   self._last_my  = 0
+
+        # Grab-swing pendulum state (set on _start_drag, animated in update()).
+        # _grip_local_(x|y) is the cursor position expressed in the displayed
+        # (post-flip) idle frame's pixel coords; rotation pivots around it.
+        self._drag_angle   = 0.0
+        self._drag_ang_vel = 0.0
+        self._grip_local_x = 0.0
+        self._grip_local_y = 0.0
 
     # ── helpers ───────────────────────────────────────────────────────────────
     @property
@@ -955,16 +969,35 @@ class Hornet:
         self.walk_in_phase = None
         self.walk_in_idx   = 0
         self.walk_in_timer = 0.0
+        # Taunt survives across mouse_down (update() only cancels it once dragging
+        # is True); cancel it here so the frame we base the grip on is an idle frame.
+        self.taunt_phase = None
+        self.taunt_idx   = 0
         self.dragging = True
         self._off_x = self.x - mx
         self._off_y = self.y - my
         self.vx = self.vy = 0.0
+        # Grip is stored relative to the idle frame that will actually be drawn
+        # during the drag (state is forced to IDLE by _upd_state while dragging).
+        idle_frame = self.idle_frames[self.idle_idx]
+        draw_x_idle = int(self.x)
+        draw_y_idle = int(self.y) + self._idle_h - idle_frame.get_height() + self._idle_y_offset()
+        self._grip_local_x = float(mx - draw_x_idle)
+        self._grip_local_y = float(my - draw_y_idle)
+        self._drag_angle   = 0.0
+        self._drag_ang_vel = 0.0
+        # Seed velocity tracker at the press point so the first _update_drag_swing
+        # measures cursor delta from where the user actually clicked.
+        self._last_mx = mx
+        self._last_my = my
+        self._mvx = 0.0
+        self._mvy = 0.0
 
     def _upd_drag(self, mx, my, dt):
-        if dt > 0:
-            self._mvx = (mx - self._last_mx) / dt
-            self._mvy = (my - self._last_my) / dt
-        self._last_mx = mx;  self._last_my = my
+        # Position sync on MOUSEMOTION. Velocity tracking + pendulum physics run
+        # in _update_drag_swing() so they fire every frame, including the frame
+        # the mouse stops moving (no MOUSEMOTION event → deceleration would be
+        # missed if we tracked velocity here).
         self.x = mx + self._off_x
         self.y = my + self._off_y
 
@@ -973,6 +1006,51 @@ class Hornet:
         self.vx = self._mvx * 0.8
         self.vy = self._mvy * 0.8
         self.inactivity_timer = 0.0
+
+    def _update_drag_swing(self, dt, mx, my):
+        """Pendulum simulation while dragged.
+
+        Runs every frame (not just on MOUSEMOTION) so an abrupt stop is detected
+        as ``new_mvx == 0`` vs. a prior non-zero ``_mvx`` and swings the sprite
+        by the resulting deceleration. Pygame's rotate uses visually-CCW = positive
+        angle; a rightward pivot jerk makes the body lag left of the pivot, which
+        is a visually-CW tilt, hence the negation on the impulse term.
+        """
+        if dt <= 0 or mx is None or my is None:
+            return
+        # Position sync in case no MOUSEMOTION event fired this frame.
+        self.x = mx + self._off_x
+        self.y = my + self._off_y
+        # Angular impulse from change in pivot velocity (bounded to tame spikes).
+        new_mvx = (mx - self._last_mx) / dt
+        new_mvy = (my - self._last_my) / dt
+        d_vx = new_mvx - self._mvx
+        cap = self.DRAG_SWING_MAX_DVX
+        if d_vx >  cap: d_vx =  cap
+        if d_vx < -cap: d_vx = -cap
+        self._drag_ang_vel += -d_vx * self.DRAG_SWING_IMPULSE_K
+        self._mvx = new_mvx
+        self._mvy = new_mvy
+        self._last_mx = mx
+        self._last_my = my
+        # Spring back to upright + viscous damping.
+        L = max(30.0, self._idle_h * 0.5)
+        omega_n_sq  = self.GRAVITY / L
+        two_zeta_wn = 2.0 * self.DRAG_SWING_DAMPING * math.sqrt(omega_n_sq)
+        ang_accel = (-omega_n_sq * math.sin(self._drag_angle)
+                     - two_zeta_wn * self._drag_ang_vel)
+        self._drag_ang_vel += ang_accel * dt
+        self._drag_angle   += self._drag_ang_vel * dt
+        # Clamp angle; kill velocity going further outward to avoid buzzing.
+        max_ang = math.radians(self.DRAG_SWING_MAX_DEG)
+        if self._drag_angle > max_ang:
+            self._drag_angle = max_ang
+            if self._drag_ang_vel > 0:
+                self._drag_ang_vel = -self._drag_ang_vel * 0.3
+        elif self._drag_angle < -max_ang:
+            self._drag_angle = -max_ang
+            if self._drag_ang_vel < 0:
+                self._drag_ang_vel = -self._drag_ang_vel * 0.3
 
     # ── state ─────────────────────────────────────────────────────────────────
     def _upd_state(self):
@@ -1334,6 +1412,7 @@ class Hornet:
             self.idle_timer = 0.0
             self.idle_idx = (self.idle_idx + 1) % len(self.idle_frames)
         if self.dragging:
+            self._update_drag_swing(dt, mx, my)
             self._upd_state(); return
 
         # Hover-proximity taunt trigger (idle on ground only)
@@ -1446,10 +1525,41 @@ class Hornet:
         return frame
 
     def draw(self, surface):
+        if self.dragging:
+            # Pivot in world coords = current mouse pos (self.x/y are kept synced
+            # to mouse + grab-offset every frame; subtracting the offset recovers it).
+            self._blit_rotated(surface, self.x - self._off_x, self.y - self._off_y)
+            return
         frame = self.display_frame()
         draw_x = int(self.x) + self._sit_x_offset(frame)
         draw_y = int(self.y) + self._idle_h - frame.get_height() + self._idle_y_offset() + self._sit_offset()
         surface.blit(frame, (draw_x, draw_y))
+
+    def _blit_rotated(self, surface, pivot_x, pivot_y):
+        """Blit the current displayed frame rotated by self._drag_angle around
+        the grip point, placing that grip point at (pivot_x, pivot_y) in `surface`.
+
+        pygame.transform.rotate uses nearest-neighbour sampling, which preserves
+        the alpha quantisation (0/255) that the Win32 chroma-key path relies on.
+        """
+        frame = self.display_frame()
+        fw, fh = frame.get_width(), frame.get_height()
+        angle_deg = math.degrees(self._drag_angle)
+        rotated = pygame.transform.rotate(frame, angle_deg)
+        rw, rh = rotated.get_width(), rotated.get_height()
+        # Rotation matrix pygame uses (positive = visually CCW on y-down screen):
+        #   x' =  x·cos + y·sin
+        #   y' = -x·sin + y·cos
+        rad = math.radians(angle_deg)
+        cos_a = math.cos(rad); sin_a = math.sin(rad)
+        off_x = self._grip_local_x - fw * 0.5
+        off_y = self._grip_local_y - fh * 0.5
+        rot_off_x =  off_x * cos_a + off_y * sin_a
+        rot_off_y = -off_x * sin_a + off_y * cos_a
+        grip_rx = rw * 0.5 + rot_off_x
+        grip_ry = rh * 0.5 + rot_off_y
+        surface.blit(rotated, (int(round(pivot_x - grip_rx)),
+                                int(round(pivot_y - grip_ry))))
 
     def shape_key(self):
         """Hashable cache key for the current visible frame."""
@@ -2454,7 +2564,14 @@ def main():
                     _win_assert_topmost(hwnd)
             screen.fill(CHROMA_KEY)
             hornet.draw_taunt_silk(screen, frame_x, z_oh)
-            screen.blit(frame, (frame_x, z_oh))
+            if hornet.dragging:
+                # The window origin is (draw_x - frame_x, draw_y - z_oh) in world
+                # coords, so mapping the mouse position into window-local coords
+                # gives the pivot for the rotated blit.
+                hornet._blit_rotated(screen, mx - (draw_x - frame_x),
+                                             my - (draw_y - z_oh))
+            else:
+                screen.blit(frame, (frame_x, z_oh))
             hornet.draw_z_particles(screen, frame_x, z_oh)
         elif ARGB_MODE and offscreen:
             render_argb(screen, offscreen, hornet)
