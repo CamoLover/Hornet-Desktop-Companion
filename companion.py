@@ -805,10 +805,14 @@ class Hornet:
         # Grab-swing pendulum state (set on _start_drag, animated in update()).
         # _grip_local_(x|y) is the cursor position expressed in the displayed
         # (post-flip) idle frame's pixel coords; rotation pivots around it.
-        self._drag_angle   = 0.0
-        self._drag_ang_vel = 0.0
-        self._grip_local_x = 0.0
-        self._grip_local_y = 0.0
+        # _drag_rest_angle is the orientation at which the CoM hangs directly
+        # below the grip under gravity, so grabs off-centre tilt Hornet immediately.
+        self._drag_angle      = 0.0
+        self._drag_ang_vel    = 0.0
+        self._drag_rest_angle = 0.0
+        self._drag_L          = 30.0
+        self._grip_local_x    = 0.0
+        self._grip_local_y    = 0.0
 
     # ── helpers ───────────────────────────────────────────────────────────────
     @property
@@ -980,10 +984,23 @@ class Hornet:
         # Grip is stored relative to the idle frame that will actually be drawn
         # during the drag (state is forced to IDLE by _upd_state while dragging).
         idle_frame = self.idle_frames[self.idle_idx]
+        fw = idle_frame.get_width()
+        fh = idle_frame.get_height()
         draw_x_idle = int(self.x)
-        draw_y_idle = int(self.y) + self._idle_h - idle_frame.get_height() + self._idle_y_offset()
+        draw_y_idle = int(self.y) + self._idle_h - fh + self._idle_y_offset()
         self._grip_local_x = float(mx - draw_x_idle)
         self._grip_local_y = float(my - draw_y_idle)
+        # Rest angle: rotation needed so the sprite's centre of mass (approximated
+        # as the frame centre) hangs directly below the grip under gravity.
+        # Using the pygame rotation matrix R(θ)·v = (v_x·cos + v_y·sin,
+        # -v_x·sin + v_y·cos), we want R(θ)·v = (0, |v|); solving gives
+        # sin θ = -v_x/|v|, cos θ = v_y/|v| → θ = atan2(-v_x, v_y).
+        v_x = fw * 0.5 - self._grip_local_x
+        v_y = fh * 0.5 - self._grip_local_y
+        self._drag_L = max(30.0, math.hypot(v_x, v_y))
+        self._drag_rest_angle = math.atan2(-v_x, v_y) if (v_x or v_y) else 0.0
+        # Start upright and let gravity swing Hornet into the rest pose over time
+        # — snapping to _drag_rest_angle looks unphysical.
         self._drag_angle   = 0.0
         self._drag_ang_vel = 0.0
         # Seed velocity tracker at the press point so the first _update_drag_swing
@@ -1007,14 +1024,46 @@ class Hornet:
         self.vy = self._mvy * 0.8
         self.inactivity_timer = 0.0
 
+    def _rotated_bounds(self, angle_rad):
+        """Bounding box of the (idle) sprite rotated by ``angle_rad`` around the
+        grip, expressed as offsets from the pivot (min_x, min_y, max_x, max_y)."""
+        idle_frame = self.idle_frames[self.idle_idx]
+        fw = idle_frame.get_width()
+        fh = idle_frame.get_height()
+        gx = self._grip_local_x
+        gy = self._grip_local_y
+        cos_a = math.cos(angle_rad); sin_a = math.sin(angle_rad)
+        # Four corners relative to the grip, rotated with pygame's convention
+        # (x' = x·cos + y·sin ; y' = -x·sin + y·cos).
+        xs = []; ys = []
+        for (cx, cy) in ((0.0 - gx, 0.0 - gy),
+                          (fw  - gx, 0.0 - gy),
+                          (0.0 - gx, fh  - gy),
+                          (fw  - gx, fh  - gy)):
+            xs.append(cx * cos_a + cy * sin_a)
+            ys.append(-cx * sin_a + cy * cos_a)
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def _bounds_fit(self, angle_rad, pivot_x, pivot_y):
+        """True if the sprite rotated by ``angle_rad`` around ``(pivot_x, pivot_y)``
+        fits inside the world bounds (taskbar as bottom, monitor rect as sides/top)."""
+        min_x, min_y, max_x, max_y = self._rotated_bounds(angle_rad)
+        return (pivot_x + min_x >= self.world_left
+                and pivot_x + max_x <= self.world_left + self.world_w
+                and pivot_y + min_y >= self.world_top
+                and pivot_y + max_y <= self.floor_y + self._idle_h)
+
     def _update_drag_swing(self, dt, mx, my):
         """Pendulum simulation while dragged.
 
-        Runs every frame (not just on MOUSEMOTION) so an abrupt stop is detected
-        as ``new_mvx == 0`` vs. a prior non-zero ``_mvx`` and swings the sprite
-        by the resulting deceleration. Pygame's rotate uses visually-CCW = positive
-        angle; a rightward pivot jerk makes the body lag left of the pivot, which
-        is a visually-CW tilt, hence the negation on the impulse term.
+        The spring pulls Hornet toward ``_drag_rest_angle`` (gravity-aligned pose
+        where the frame centre hangs below the grip); starting from angle 0 makes
+        the fall to that pose progressive. Rotation is constrained by the world
+        edges + taskbar: instead of teleporting the pivot up, we bisect the swing
+        angle so the rotated sprite rests against the barrier — that way grabbing
+        Hornet's feet on the taskbar keeps her almost-but-not-fully upside-down
+        until the user lifts, exactly matching the "she falls onto the taskbar"
+        expectation.
         """
         if dt <= 0 or mx is None or my is None:
             return
@@ -1022,6 +1071,9 @@ class Hornet:
         self.x = mx + self._off_x
         self.y = my + self._off_y
         # Angular impulse from change in pivot velocity (bounded to tame spikes).
+        # Rightward pivot jerk (positive d_vx) makes the body lag left of the
+        # pivot, which is a visually-CW tilt = pygame-negative angle → the
+        # negation aligns physics with pygame's CCW-positive rotation convention.
         new_mvx = (mx - self._last_mx) / dt
         new_mvy = (my - self._last_my) / dt
         d_vx = new_mvx - self._mvx
@@ -1033,24 +1085,52 @@ class Hornet:
         self._mvy = new_mvy
         self._last_mx = mx
         self._last_my = my
-        # Spring back to upright + viscous damping.
-        L = max(30.0, self._idle_h * 0.5)
-        omega_n_sq  = self.GRAVITY / L
+        # Spring toward the rest angle + viscous damping (standard pendulum ODE).
+        omega_n_sq  = self.GRAVITY / self._drag_L
         two_zeta_wn = 2.0 * self.DRAG_SWING_DAMPING * math.sqrt(omega_n_sq)
-        ang_accel = (-omega_n_sq * math.sin(self._drag_angle)
-                     - two_zeta_wn * self._drag_ang_vel)
+        delta = self._drag_angle - self._drag_rest_angle
+        ang_accel = -omega_n_sq * math.sin(delta) - two_zeta_wn * self._drag_ang_vel
         self._drag_ang_vel += ang_accel * dt
-        self._drag_angle   += self._drag_ang_vel * dt
-        # Clamp angle; kill velocity going further outward to avoid buzzing.
-        max_ang = math.radians(self.DRAG_SWING_MAX_DEG)
-        if self._drag_angle > max_ang:
-            self._drag_angle = max_ang
-            if self._drag_ang_vel > 0:
-                self._drag_ang_vel = -self._drag_ang_vel * 0.3
-        elif self._drag_angle < -max_ang:
-            self._drag_angle = -max_ang
-            if self._drag_ang_vel < 0:
-                self._drag_ang_vel = -self._drag_ang_vel * 0.3
+        proposed_angle = self._drag_angle + self._drag_ang_vel * dt
+        # ── barrier collision ────────────────────────────────────────────────
+        # Prefer clamping the angle (sprite rotates only as far as it fits at the
+        # current pivot). Only if the pivot itself is deep enough that no angle
+        # works do we fall back to lifting the pivot away from the barrier.
+        pivot_x = self.x - self._off_x
+        pivot_y = self.y - self._off_y
+        if not self._bounds_fit(proposed_angle, pivot_x, pivot_y):
+            if self._bounds_fit(self._drag_angle, pivot_x, pivot_y):
+                # Bisect between last-frame angle (fits) and proposal (doesn't).
+                lo, hi = self._drag_angle, proposed_angle
+                for _ in range(12):
+                    mid = (lo + hi) * 0.5
+                    if self._bounds_fit(mid, pivot_x, pivot_y):
+                        lo = mid
+                    else:
+                        hi = mid
+                proposed_angle = lo
+                # Kill outward velocity so gravity doesn't keep piling into the wall.
+                self._drag_ang_vel = 0.0
+            else:
+                # Even the previous angle doesn't fit — pivot moved deeper into a
+                # wall (e.g. cursor dragged below the taskbar). Fall back to the
+                # rest angle and clamp the pivot itself so nothing goes off-screen.
+                proposed_angle = self._drag_rest_angle
+                min_x, min_y, max_x, max_y = self._rotated_bounds(proposed_angle)
+                world_right  = self.world_left + self.world_w
+                floor_bottom = self.floor_y + self._idle_h
+                if pivot_x + min_x < self.world_left:
+                    pivot_x = self.world_left - min_x
+                elif pivot_x + max_x > world_right:
+                    pivot_x = world_right - max_x
+                if pivot_y + min_y < self.world_top:
+                    pivot_y = self.world_top - min_y
+                if pivot_y + max_y > floor_bottom:
+                    pivot_y = floor_bottom - max_y
+                self.x = pivot_x + self._off_x
+                self.y = pivot_y + self._off_y
+                self._drag_ang_vel = 0.0
+        self._drag_angle = proposed_angle
 
     # ── state ─────────────────────────────────────────────────────────────────
     def _upd_state(self):
@@ -2542,17 +2622,30 @@ def main():
 
         # Render
         if PLAT == 'Windows':
-            draw_x, draw_y = hornet.draw_pos()
             u32 = ctypes.windll.user32
-            # Move the small window to follow the sprite (SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE)
-            # Window is positioned Z_OVERHEAD pixels above the sprite so Z particles have
-            # room to float upward without being clipped.
             z_oh = int(Z_OVERHEAD * SPRITE_SCALE)
-            # Center the current frame horizontally within the window so that
-            # wider layers (taunt silk) don't overflow and get clipped on the sides.
             frame = hornet.display_frame()
             frame_x = (screen.get_width() - frame.get_width()) // 2
-            u32.SetWindowPos(hwnd, 0, draw_x - frame_x, draw_y - z_oh, 0, 0, 0x0015)
+            if hornet.dragging:
+                # Follow the *rotated* bounding box, not the unrotated draw_pos:
+                # a big rotation (e.g. grabbed by the feet) swings the sprite far
+                # outside the idle-frame footprint, so the fixed sprite-sized
+                # window has to slide to keep the rotated bitmap inside.
+                min_x, min_y, max_x, max_y = hornet._rotated_bounds(hornet._drag_angle)
+                piv_wx = hornet.x - hornet._off_x
+                piv_wy = hornet.y - hornet._off_y
+                sprite_cx = piv_wx + (min_x + max_x) * 0.5
+                sprite_cy = piv_wy + (min_y + max_y) * 0.5
+                win_left  = int(sprite_cx - screen.get_width()  * 0.5)
+                win_top   = int(sprite_cy - screen.get_height() * 0.5)
+                u32.SetWindowPos(hwnd, 0, win_left, win_top, 0, 0, 0x0015)
+                draw_x, draw_y = win_left + frame_x, win_top + z_oh  # unused visually now
+            else:
+                draw_x, draw_y = hornet.draw_pos()
+                # Move the small window to follow the sprite. Window is positioned
+                # Z_OVERHEAD pixels above the sprite so Z particles have room to
+                # float upward without being clipped.
+                u32.SetWindowPos(hwnd, 0, draw_x - frame_x, draw_y - z_oh, 0, 0, 0x0015)
             if tray_globals['topmost'] and u32.GetWindow(hwnd, 3):
                 # Something is above Hornet -  reassert unless a menu or capturing
                 # popup is active (GetGUIThreadInfo catches Win32 menus incl.
@@ -2565,11 +2658,9 @@ def main():
             screen.fill(CHROMA_KEY)
             hornet.draw_taunt_silk(screen, frame_x, z_oh)
             if hornet.dragging:
-                # The window origin is (draw_x - frame_x, draw_y - z_oh) in world
-                # coords, so mapping the mouse position into window-local coords
-                # gives the pivot for the rotated blit.
-                hornet._blit_rotated(screen, mx - (draw_x - frame_x),
-                                             my - (draw_y - z_oh))
+                piv_wx = hornet.x - hornet._off_x
+                piv_wy = hornet.y - hornet._off_y
+                hornet._blit_rotated(screen, piv_wx - win_left, piv_wy - win_top)
             else:
                 screen.blit(frame, (frame_x, z_oh))
             hornet.draw_z_particles(screen, frame_x, z_oh)
