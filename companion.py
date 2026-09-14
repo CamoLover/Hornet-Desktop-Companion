@@ -337,6 +337,7 @@ tray_globals = {
     'hwnd': None,
     'sleep_z': True,           # Show floating Z's while sleeping
     'soft_land': False,        # Play landing/wall-cling animations instead of bouncing
+    'drag_pendulum': True,     # Swing sprite around grip while dragged
     'cloak_color': 'default',  # Cloak hue: 'default' or '#RRGGBB'
     'spawn_mode': 'fall',      # 'fall' | 'walk_from_right' | 'walk_from_left'
 }
@@ -1085,6 +1086,12 @@ class Hornet:
         self._mvy = new_mvy
         self._last_mx = mx
         self._last_my = my
+        if not tray_globals.get('drag_pendulum', True):
+            # Pendulum disabled: keep _drag_angle at 0 so _blit_rotated / _rotated_bounds
+            # collapse to axis-aligned no-ops; throw velocity is still tracked above.
+            self._drag_angle = 0.0
+            self._drag_ang_vel = 0.0
+            return
         # Spring toward the rest angle + viscous damping (standard pendulum ODE).
         omega_n_sq  = self.GRAVITY / self._drag_L
         two_zeta_wn = 2.0 * self.DRAG_SWING_DAMPING * math.sqrt(omega_n_sq)
@@ -1690,6 +1697,7 @@ _CONFIG_DEFAULTS = {
     'wall_slide_fps': 0.08,
     'sleep_z':        True,
     'soft_land':      False,
+    'drag_pendulum':  True,
     'taunt_fps':      0.05,
     'taunt_cooldown': 120.0,
     'taunt_hover_time': 2.5,
@@ -1798,6 +1806,7 @@ def load_config(apply_volume=False):
     tray_globals['volume']      = float(cfg['volume'])
     tray_globals['sleep_z']     = bool(cfg['sleep_z'])
     tray_globals['soft_land']   = bool(cfg['soft_land'])
+    tray_globals['drag_pendulum'] = bool(cfg['drag_pendulum'])
     tray_globals['cloak_color'] = CLOAK_COLOR
     sm = str(cfg['spawn_mode'])
     if sm not in _SPAWN_MODES:
@@ -1889,6 +1898,10 @@ def _show_context_menu(x, y, hornet_ref, on_quit=None):
                 tray_globals['soft_land'] = not tray_globals['soft_land']
                 _save_config_key('soft_land', tray_globals['soft_land'])
 
+            def on_toggle_drag_pendulum():
+                tray_globals['drag_pendulum'] = not tray_globals['drag_pendulum']
+                _save_config_key('drag_pendulum', tray_globals['drag_pendulum'])
+
             def on_reload_config():
                 load_config(apply_volume=True)
 
@@ -1956,6 +1969,9 @@ def _show_context_menu(x, y, hornet_ref, on_quit=None):
             soft_land_var = tk.BooleanVar(value=tray_globals['soft_land'])
             pop.add_checkbutton(label='Soft Landing', variable=soft_land_var,
                                 command=close_run(on_toggle_soft_land))
+            drag_pendulum_var = tk.BooleanVar(value=tray_globals['drag_pendulum'])
+            pop.add_checkbutton(label='Drag Pendulum', variable=drag_pendulum_var,
+                                command=close_run(on_toggle_drag_pendulum))
             pop.add_separator()
             pop.add_command(label='Reload Config', command=close_run(on_reload_config))
             if PLAT == 'Windows':
@@ -2032,6 +2048,10 @@ def _create_tray_icon(hwnd, hornet_ref):
         tray_globals['soft_land'] = not tray_globals['soft_land']
         _save_config_key('soft_land', tray_globals['soft_land'])
 
+    def on_toggle_drag_pendulum(icon=None, item=None):
+        tray_globals['drag_pendulum'] = not tray_globals['drag_pendulum']
+        _save_config_key('drag_pendulum', tray_globals['drag_pendulum'])
+
     def on_cloak_preset(color_val):
         def handler(icon=None, item=None):
             _set_cloak_color(color_val)
@@ -2092,6 +2112,8 @@ def _create_tray_icon(hwnd, hornet_ref):
                      checked=lambda item: tray_globals['sleep_z']),
             MenuItem('Soft Landing', on_toggle_soft_land,
                      checked=lambda item: tray_globals['soft_land']),
+            MenuItem('Drag Pendulum', on_toggle_drag_pendulum,
+                     checked=lambda item: tray_globals['drag_pendulum']),
             MenuItem('Reload Config', on_reload_config),
             MenuItem('Reset Topmost', on_reset_topmost),
             MenuItem('Quit', on_quit),
