@@ -339,6 +339,7 @@ tray_globals = {
     'land_mode': 'bounce',     # 'bounce' | 'soft' | 'glide' (soft + umbrella glide on high falls)
     'drag_pendulum': True,     # Swing sprite around grip while dragged
     'wander': True,            # Walk around / read the map on her own while idle
+    'window_platforms': True,  # Stand on / climb desktop windows (Windows only)
     'cloak_color': 'default',  # Cloak hue: 'default' or '#RRGGBB'
     'spawn_mode': 'fall',      # 'fall' | 'walk_from_right' | 'walk_from_left'
 }
@@ -489,6 +490,133 @@ def _win_assert_topmost(hwnd):
     u.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0013)  # HWND_NOTOPMOST
     u.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0013)  # HWND_TOPMOST
 
+class Platform:
+    """Top edge of a desktop window Hornet can stand on. `segs` are the parts of
+    that edge not hidden behind windows above it in z-order (where she can land)."""
+    __slots__ = ('hwnd', 'l', 't', 'r', 'b', 'segs')
+
+    def __init__(self, hwnd, l, t, r, b, segs):
+        self.hwnd, self.l, self.t, self.r, self.b, self.segs = hwnd, l, t, r, b, segs
+
+
+_PLATFORM_SKIP_CLASSES = {
+    'Shell_TrayWnd', 'Shell_SecondaryTrayWnd', 'Windows.UI.Core.CoreWindow',
+    'NotifyIconOverflowWindow', 'TopLevelWindowForOverflowXamlIsland',
+    'XamlExplorerHostIslandWindow', 'Shell_InputSwitchTopLevelWindow',
+    'TaskListThumbnailWnd',
+}
+_PLATFORM_MIN_W = 160      # narrower windows are not worth standing on
+_scan_api = None
+
+
+def _win_scan_api():
+    import ctypes.wintypes as wt
+    # Private DLL handles so these argtypes don't clash with the rest of the app
+    u = ctypes.WinDLL('user32')
+    d = ctypes.WinDLL('dwmapi')
+    proto = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    u.EnumWindows.argtypes = [proto, wt.LPARAM]
+    for name in ('IsWindowVisible', 'IsIconic', 'IsZoomed', 'GetWindowTextLengthW'):
+        getattr(u, name).argtypes = [wt.HWND]
+    u.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+    u.GetWindowLongW.restype = ctypes.c_long
+    u.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+    u.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+    u.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+    d.DwmGetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD]
+    d.DwmGetWindowAttribute.restype = ctypes.c_long
+    # DWM frame bounds are physical pixels, but this process is DPI-unaware and
+    # everything else (cursor, monitors, our window) is in scaled pixels.
+    g = ctypes.WinDLL('gdi32')
+    u.GetDC.argtypes = [wt.HWND]
+    u.GetDC.restype = wt.HDC
+    u.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+    g.GetDeviceCaps.argtypes = [wt.HDC, ctypes.c_int]
+    hdc = u.GetDC(None)
+    logical, physical = g.GetDeviceCaps(hdc, 8), g.GetDeviceCaps(hdc, 118)  # HORZRES, DESKTOPHORZRES
+    u.ReleaseDC(None, hdc)
+    dwm_scale = logical / physical if logical and physical else 1.0
+    return u, d, proto, wt, dwm_scale
+
+
+def _subtract_span(segs, a, b):
+    out = []
+    for l, r in segs:
+        if b <= l or a >= r:
+            out.append((l, r))
+            continue
+        if a > l:
+            out.append((l, a))
+        if b < r:
+            out.append((b, r))
+    return out
+
+
+def _win_scan_platforms():
+    """Visible top-level windows as Platforms, topmost first. Never raises."""
+    global _scan_api
+    try:
+        if _scan_api is None:
+            _scan_api = _win_scan_api()
+        u, d, proto, wt, dwm_scale = _scan_api
+        own_pid = os.getpid()
+        cls_buf = ctypes.create_unicode_buffer(128)
+        wins = []
+
+        def _cb(hwnd, _lp):
+            if not u.IsWindowVisible(hwnd) or u.IsIconic(hwnd):
+                return True
+            pid = wt.DWORD()
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == own_pid:          # Hornet herself, her menus, color picker
+                return True
+            cloaked = ctypes.c_int(0)
+            d.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), 4)   # DWMWA_CLOAKED
+            if cloaked.value:                 # other virtual desktop / hidden UWP shell
+                return True
+            r = wt.RECT()
+            # Extended frame bounds = the visible frame (GetWindowRect adds invisible borders)
+            if d.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) == 0:
+                l, t = round(r.left * dwm_scale), round(r.top * dwm_scale)
+                rr, bb = round(r.right * dwm_scale), round(r.bottom * dwm_scale)
+            else:
+                u.GetWindowRect(hwnd, ctypes.byref(r))
+                l, t, rr, bb = r.left, r.top, r.right, r.bottom
+            if rr - l < 4 or bb - t < 4:
+                return True
+            u.GetClassNameW(hwnd, cls_buf, 128)
+            cls = cls_buf.value
+            if cls in ('Progman', 'WorkerW'):  # the desktop itself
+                return True
+            ex = u.GetWindowLongW(hwnd, -20)
+            if ex & 0x20:                      # WS_EX_TRANSPARENT overlays
+                return True
+            titled = u.GetWindowTextLengthW(hwnd) > 0
+            is_plat = (titled and not (ex & 0x80) and cls not in _PLATFORM_SKIP_CLASSES
+                       and not u.IsZoomed(hwnd) and rr - l >= _PLATFORM_MIN_W)
+            wins.append((int(hwnd), l, t, rr, bb, is_plat))
+            return True
+
+        u.EnumWindows(proto(_cb), 0)
+    except Exception as e:
+        print(f"[platforms] scan failed: {e}")
+        return []
+
+    plats = []
+    for i, (h, l, t, r, b, is_plat) in enumerate(wins):
+        if not is_plat:
+            continue
+        segs = [(l, r)]
+        for (_h, l2, t2, r2, b2, _p) in wins[:i]:
+            if t2 <= t < b2:                  # a window above covers this top edge
+                segs = _subtract_span(segs, l2, r2)
+                if not segs:
+                    break
+        segs = [(a, c) for a, c in segs if c - a >= 40]
+        plats.append(Platform(h, l, t, r, b, segs))
+    return plats
+
+
 def _win_click_through(hwnd, enable: bool):
     u = ctypes.windll.user32
     s = u.GetWindowLongW(hwnd, -20)
@@ -527,6 +655,23 @@ def load_raw_assets():
         'map_idle':   _num_sorted(_resource('assets/sprites/map_idle/map_idle_*.png')),
         'map_walk':   _num_sorted(_resource('assets/sprites/map_walk/map_walk_*.png')),
         'map_turn':   _num_sorted(_resource('assets/sprites/map_turn/map_turn_*.png')),
+        'run':        _num_sorted(_resource('assets/sprites/run/run_*.png')),
+        'run_start':  _num_sorted(_resource('assets/sprites/run_start/run_start_*.png')),
+        'run_stop':   _num_sorted(_resource('assets/sprites/run_stop/run_stop_*.png')),
+        'jump':       _num_sorted(_resource('assets/sprites/jump/jump_*.png')),
+        'hop':        _num_sorted(_resource('assets/sprites/hop/hop_*.png')),
+        'hop_land':   _num_sorted(_resource('assets/sprites/hop_land/hop_land_*.png')),
+        'somersault': _num_sorted(_resource('assets/sprites/somersault/somersault_*.png')),
+        'fall':       _num_sorted(_resource('assets/sprites/fall/fall_*.png')),
+        'weak_fall':  _num_sorted(_resource('assets/sprites/weak_fall/weak_fall_*.png')),
+        'bonk_land':  _num_sorted(_resource('assets/sprites/bonk_land/bonk_land_*.png')),
+        'wall_mantle': _num_sorted(_resource('assets/sprites/wall_mantle/wall_mantle_*.png')),
+        'mantle_land': _num_sorted(_resource('assets/sprites/mantle_land/mantle_land_*.png')),
+        'walljump':   _num_sorted(_resource('assets/sprites/walljump/walljump_*.png')),
+        'climb':      _num_sorted(_resource('assets/sprites/climb/climb_*.png')),
+        'climb_cling': _num_sorted(_resource('assets/sprites/climb_cling/climb_cling_*.png')),
+        'walljump_antic': _num_sorted(_resource('assets/sprites/walljump_antic/walljump_antic_*.png')),
+        'sit_rest':   _num_sorted(_resource('assets/sprites/sit_rest/sit_rest_*.png')),
         'umbrella_open':  _num_sorted(_resource('assets/sprites/umbrella_open/umbrella_open_*.png')),
         'umbrella_float': _num_sorted(_resource('assets/sprites/umbrella_float/umbrella_float_*.png')),
         'umbrella_close': _num_sorted(_resource('assets/sprites/umbrella_close/umbrella_close_*.png')),
@@ -732,6 +877,29 @@ class Hornet:
     WANDER_WALK_DIST   = (150.0, 500.0)  # px range of a walk (unscaled)
     MAP_WALK_DIST      = (60.0, 250.0)   # px range of a walk while reading (unscaled)
 
+    # Getting around windows: running, jumping, climbing (window_platforms)
+    IDLE_FACE_X     = 92.8    # face column in the idle frame (unscaled art)
+    WALL_FACE_D     = 50.0    # face distance from the wall while clinging (unscaled art)
+    RUN_FPS         = 0.06    # seconds per frame for run / run start / run stop
+    RUN_STRIDE_PX   = 21.0    # px the planted foot travels per run frame (unscaled art)
+    CLIMB_FPS       = 0.06    # seconds per frame for the scramble leap / cling / wall-jump antic
+    CLIMB_CROUCH    = 0.08    # seconds crouched against the wall before each leap
+    CLIMB_SETTLE    = 0.16    # seconds settled in the cling after each leap
+    CLIMB_HOP       = 0.9     # height gained per scramble leap (x her height)
+    MANTLE_FPS      = 0.07    # seconds per frame for pulling up over a ledge
+    HOP_LAND_FPS    = 0.05    # seconds per frame for the light landing after a jump
+    BONK_LAND_FPS   = 0.07    # seconds per frame for landing after a tumble
+    SIT_REST_FPS    = 0.1     # seconds per frame for the quiet sit (no music)
+    EXTRA_SEQS = ('run', 'run_start', 'run_stop', 'jump', 'hop', 'hop_land', 'somersault',
+                  'fall', 'weak_fall', 'bonk_land', 'wall_mantle', 'mantle_land', 'walljump',
+                  'climb', 'climb_cling', 'walljump_antic', 'sit_rest')
+    GROUND_PHASES = frozenset(('turn', 'walk_start', 'walk', 'walk_stop', 'run_start', 'run',
+                               'run_stop', 'map_open', 'map_idle', 'map_turn', 'map_walk',
+                               'map_close'))
+    WALL_PHASES   = frozenset(('climb_crouch', 'climb_leap', 'climb_settle', 'cling',
+                               'walljump_antic'))
+    CENTRED_LANDS = frozenset(('hop_land', 'bonk_land'))
+
     # Umbrella glide (land_mode == 'glide'): high falls open the umbrella and drift down.
     GLIDE_FPS          = 0.07   # seconds per frame for the float loop
     GLIDE_OPEN_FPS     = 0.05   # seconds per frame for the open (inflate) animation
@@ -793,6 +961,7 @@ class Hornet:
         self.map_idle_frames    = seqs['map_idle']
         self.map_walk_frames    = seqs['map_walk']
         self.map_turn_frames    = seqs['map_turn']
+        self.bind_extra_frames(seqs)
         self.floor_y            = floor_y
 
         self.state        = 'IDLE'
@@ -839,6 +1008,38 @@ class Hornet:
         self.wander_then_map  = False   # open the map after this walk stops
         self.wander_map_time  = 0.0     # seconds left reading before deciding what's next
         self.wander_map_walks = 0       # map walks left before putting the map away
+        self.wander_gait      = 'walk'  # 'walk' | 'run' for the current goto
+
+        # Plans: queued steps ('goto', 'jump', 'climb', 'walljump', 'map', 'sit')
+        self.plan         = []
+        self.plan_running = False
+
+        # Window platforms
+        self.platforms  = []     # Platform list from the last window scan
+        self.support    = None   # Platform she's standing on (None = monitor floor)
+        self.floor_plat = None   # Platform the current floor_y belongs to
+
+        # Airborne on her own (jumps, drops): None|'jump'|'hop'|'somersault'|
+        #                                      'walljump'|'fall'|'weak_fall'
+        self.air_anim   = None
+        self.air_idx    = 0
+        self.air_t      = 0.0
+        self.air_apex_t = None
+        self.air_catch  = None   # (t, x, y, climb step) to grab a wall mid-jump
+
+        # Climbing: the wall she's on and where she stops
+        self.climb_wall_x = 0.0
+        self.climb_side   = 'left'   # which side of her the wall is on
+        self.climb_stop_y = 0.0
+        self.climb_ledge  = None     # hwnd of the window to mantle onto at the top
+        self.leap_y0      = 0.0      # y where the current scramble leap started
+        self.leap_h       = 0.0      # height of the current scramble leap
+        self.climb_rect   = None     # that window's rect when she started climbing it
+        self.wj_target    = None     # (x, y, catch) for the queued wall jump
+
+        # Quiet sit (no music) used when she rests on her own
+        self.sit_quiet     = False
+        self.sit_rest_time = 0.0
 
         # taunt state
         self.taunt_phase         = None   # None | 'taunting'
@@ -902,6 +1103,10 @@ class Hornet:
     def wandering(self):
         return self.wander_phase is not None
 
+    def bind_extra_frames(self, seqs):
+        for k in self.EXTRA_SEQS:
+            setattr(self, k + '_frames', seqs[k])
+
     @property
     def _idle_w(self): return self.idle_frames[0].get_width()
     @property
@@ -930,6 +1135,12 @@ class Hornet:
             return self.sleep_wake_frames[10 + self.land_idx]
         if self.wander_phase is not None:
             return self._wander_frame()
+        if self.air_anim is not None:
+            return getattr(self, self.air_anim + '_frames')[self.air_idx]
+        if self.land_phase == 'hop_land':
+            return self.hop_land_frames[self.land_idx]
+        if self.land_phase == 'bonk_land':
+            return self.bonk_land_frames[self.land_idx]
         if self.glide_phase == 'open':
             return self.umbrella_open_frames[self.glide_idx]
         if self.glide_phase == 'float':
@@ -942,6 +1153,8 @@ class Hornet:
             return self.sit_down_frames[self.sit_idx]
         if self.sit_phase == 'sit_pause_pre':
             return self.sit_down_frames[-1]
+        if self.sit_phase == 'sit_rest':
+            return self.sit_rest_frames[self.sit_idx]
         if self.sit_phase == 'sit_intro':
             return self.sit_intro_frames[self.sit_idx]
         if self.sit_phase == 'sit_loop':
@@ -1014,7 +1227,13 @@ class Hornet:
                 return
             if self.sleeping:
                 return  # ignore during sleep transitions
-            if self.sit_phase == 'sit_loop':
+            if self.sit_phase == 'sit_rest':
+                # Resting on her own: a click makes her play for you instead
+                self._cancel_wander()
+                self.sit_quiet = False
+                self.sit_phase = 'sit_pause_pre'
+                self.sit_timer = 0.0
+            elif self.sit_phase == 'sit_loop':
                 # Graceful exit: play the outro sequence
                 self.sit_phase = 'sit_outro'
                 self.sit_idx   = 0
@@ -1047,10 +1266,15 @@ class Hornet:
         self.sit_phase = None
         self.sit_idx   = 0
         self.sit_timer = 0.0
+        self.sit_quiet = False
 
     def _start_drag(self, mx, my):
         self.land_phase  = None
         self.glide_phase = None
+        self.air_anim    = None
+        self.air_catch   = None
+        self.climb_ledge = None
+        self.climb_rect  = None
         self._cancel_wander()
         # Grabbing during the walk-in entrance cancels it so the user is in control.
         self.walk_in_phase = None
@@ -1224,7 +1448,7 @@ class Hornet:
     # ── state ─────────────────────────────────────────────────────────────────
     def _upd_state(self):
         if (self.sitting or self.dragging or self.land_phase is not None
-                or self.gliding or self.wandering):
+                or self.gliding or self.wandering or self.air_anim is not None):
             self.state = 'IDLE'; return
         spd = math.hypot(self.vx, self.vy)
         if spd < 80 or self.vy <= 0:
@@ -1245,8 +1469,20 @@ class Hornet:
                 self.sit_timer = 0.0
                 self.sit_idx += 1
                 if self.sit_idx >= len(self.sit_down_frames):
-                    self.sit_phase = 'sit_pause_pre'
+                    self.sit_phase = 'sit_rest' if self.sit_quiet else 'sit_pause_pre'
+                    self.sit_idx   = 0
                     self.sit_timer = 0.0
+
+        elif p == 'sit_rest':
+            self.sit_rest_time -= dt
+            self.sit_timer += dt
+            if self.sit_timer >= self.SIT_REST_FPS:
+                self.sit_timer = 0.0
+                self.sit_idx = (self.sit_idx + 1) % len(self.sit_rest_frames)
+            if self.sit_rest_time <= 0:
+                self.sit_phase = 'sit_up'
+                self.sit_idx   = 0
+                self.sit_timer = 0.0
 
         elif p == 'sit_pause_pre':
             self.sit_timer += dt
@@ -1295,6 +1531,10 @@ class Hornet:
                 self.sit_idx += 1
                 if self.sit_idx >= len(self.sit_up_frames):
                     self.sit_phase = None  # done -  back to idle
+                    if self.sit_quiet:
+                        self.sit_quiet = False
+                        if self.plan_running:
+                            self._next_step()
 
     # ── sleep state machine ───────────────────────────────────────────────────
     def _update_sleep(self, dt):
@@ -1334,6 +1574,18 @@ class Hornet:
                 self.land_idx += 1
                 if self.land_idx >= len(self.land_frames):
                     self.land_phase = None  # back to idle
+                    self._land_done()
+
+        elif p in ('hop_land', 'bonk_land'):
+            frames = self.hop_land_frames if p == 'hop_land' else self.bonk_land_frames
+            fps    = self.HOP_LAND_FPS if p == 'hop_land' else self.BONK_LAND_FPS
+            self.land_timer += dt
+            if self.land_timer >= fps:
+                self.land_timer = 0.0
+                self.land_idx += 1
+                if self.land_idx >= len(frames):
+                    self.land_phase = None
+                    self._land_done()
 
         elif p == 'wall_cling':
             if self.wall_side == 'right':
@@ -1364,8 +1616,9 @@ class Hornet:
                 if self.land_idx < len(self.wall_slide_frames) - 1:
                     self.land_idx += 1
             # Floor under the wall she's clinging to (recomputed each tick in
-            # case monitors of different heights meet at this world edge)
-            self.floor_y = self._floor_for_x(self.x + self._idle_w / 2)
+            # case monitors of different heights meet at this world edge, or a
+            # window top sits under her)
+            self.floor_y = self._floor_here()
             # Transition to wall_land when she reaches the floor
             if self.y >= self.floor_y:
                 self.y = self.floor_y
@@ -1404,6 +1657,8 @@ class Hornet:
 
     # ── umbrella glide ────────────────────────────────────────────────────────
     def _start_glide(self):
+        self.air_anim    = None
+        self.air_catch   = None
         self.glide_phase = 'open'
         self.glide_idx   = 0
         self.glide_timer = 0.0
@@ -1647,18 +1902,36 @@ class Hornet:
                     # facing_right is preserved so the idle sprite keeps the same
                     # inward-facing orientation Hornet had while stopping.
 
-    # ── wandering ─────────────────────────────────────────────────────────────
+    # ── wandering & getting around ────────────────────────────────────────────
+    # Everything she does on her own is a *plan*: a queue of steps run one after
+    # another. Ground and wall moves play as wander phases; jumps hand over to the
+    # physics with an air_anim, and the plan resumes once she has landed.
+    #   ('goto', x, gait)                         walk/run to x on her surface
+    #   ('jump', x, y, style[, climb_step])       ballistic jump; optional wall catch
+    #   ('climb', wall_x, side, stop_y, ledge)    climb a wall, mantle onto ledge
+    #   ('walljump', x, y, climb_step|None)       from a cling, leap to x,y
+    #   ('map',)  ('sit', seconds)
     def _wander_frame(self) -> pygame.Surface:
         p, i = self.wander_phase, self.wander_idx
         if p == 'turn':       return self.turn_frames[i]
         if p == 'walk_start': return self.walk_stop_frames[-1 - i]   # stop, played backwards
         if p == 'walk':       return self.walk_frames[i]
         if p == 'walk_stop':  return self.walk_stop_frames[i]
+        if p == 'run_start':  return self.run_start_frames[i]
+        if p == 'run':        return self.run_frames[i]
+        if p == 'run_stop':   return self.run_stop_frames[i]
         if p == 'map_open':   return self.map_open_frames[i]
         if p == 'map_idle':   return self.map_idle_frames[i]
         if p == 'map_turn':   return self.map_turn_frames[i]
         if p == 'map_walk':   return self.map_walk_frames[i]
-        return self.map_open_frames[-1 - i]                           # map_close
+        if p == 'map_close':  return self.map_open_frames[-1 - i]
+        if p == 'climb_crouch':   return self.climb_frames[0]
+        if p == 'climb_leap':     return self.climb_frames[1 + i]
+        if p == 'climb_settle':   return self.climb_frames[-1]
+        if p == 'cling':          return self.climb_cling_frames[i]
+        if p == 'walljump_antic': return self.walljump_antic_frames[i]
+        if p == 'mantle':         return self.wall_mantle_frames[0]   # rolling over the corner
+        return self.mantle_land_frames[i]                             # mantle_land
 
     def _wander_seq_info(self, p):
         """(frame count, seconds per frame, loops?) for a wander phase."""
@@ -1667,11 +1940,21 @@ class Hornet:
             'walk_start': (len(self.walk_stop_frames), self.WANDER_WALK_FPS, False),
             'walk':       (len(self.walk_frames),      self.WANDER_WALK_FPS, True),
             'walk_stop':  (len(self.walk_stop_frames), self.WANDER_WALK_FPS, False),
+            'run_start':  (len(self.run_start_frames), self.RUN_FPS,         False),
+            'run':        (len(self.run_frames),       self.RUN_FPS,         True),
+            'run_stop':   (len(self.run_stop_frames),  self.RUN_FPS,         False),
             'map_open':   (len(self.map_open_frames),  self.MAP_OPEN_FPS,    False),
             'map_idle':   (len(self.map_idle_frames),  self.MAP_IDLE_FPS,    True),
             'map_turn':   (len(self.map_turn_frames),  self.MAP_OPEN_FPS,    False),
             'map_walk':   (len(self.map_walk_frames),  self.MAP_WALK_FPS,    True),
             'map_close':  (len(self.map_open_frames),  self.MAP_OPEN_FPS,    False),
+            'climb_crouch':   (1,                               self.CLIMB_CROUCH, False),
+            'climb_leap':     (len(self.climb_frames) - 2,      self.CLIMB_FPS,    False),
+            'climb_settle':   (1,                               self.CLIMB_SETTLE, False),
+            'cling':          (len(self.climb_cling_frames),    self.CLIMB_FPS,   False),
+            'walljump_antic': (len(self.walljump_antic_frames), self.CLIMB_FPS,   False),
+            'mantle':         (1,                               self.MANTLE_FPS * 2, False),
+            'mantle_land':    (len(self.mantle_land_frames),    self.MANTLE_FPS,  False),
         }[p]
 
     def _set_wander_phase(self, p):
@@ -1680,36 +1963,253 @@ class Hornet:
         self.wander_timer = 0.0
 
     def _cancel_wander(self):
+        """Interrupted (grabbed, clicked, taunted, dropped): forget the plan."""
         self.wander_phase = None
         self.wander_idx   = 0
         self.wander_timer = 0.0
+        self.plan         = []
+        self.plan_running = False
+        self.wj_target    = None
         self.wander_wait  = max(self.wander_wait, self.WANDER_IDLE_MIN)
 
     def _end_wander(self):
         self.wander_phase = None
         self.wander_idx   = 0
         self.wander_timer = 0.0
+        self.plan         = []
+        self.plan_running = False
         self.idle_idx     = 0
         self.idle_timer   = 0.0
         self.wander_wait  = random.uniform(self.WANDER_IDLE_MIN, self.WANDER_IDLE_MAX)
 
-    def _wander_bounds(self):
-        """Allowed x range (top-left) for wandering: the work area of the monitor
-        she's standing on, so she never walks onto a monitor with another floor."""
-        lo = self.world_left
-        hi = self.world_left + self.world_w - self._idle_w
-        cx = self.x + self._idle_w / 2
+    # ── plan runner ──
+    def _start_plan(self, steps):
+        self.plan         = list(steps)
+        self.plan_running = True
+        self._next_step()
+
+    def _next_step(self):
+        self.wander_phase = None
+        self.wander_idx   = 0
+        self.wander_timer = 0.0
+        if not self.plan:
+            self._end_wander()
+            return
+        step, args = self.plan[0][0], self.plan[0][1:]
+        self.plan.pop(0)
+        if step == 'goto':
+            self._start_goto(*args)
+        elif step == 'jump':
+            self._start_jump(*args)
+        elif step == 'climb':
+            self._start_climb(*args)
+        elif step == 'walljump':
+            self.wj_target = args
+            self._set_wander_phase('walljump_antic')
+        elif step == 'map':
+            self._start_map()
+        elif step == 'sit':
+            self._start_rest_sit(*args)
+        else:
+            self._next_step()
+
+    def _land_done(self):
+        """A landing animation finished: carry on with the plan, if any."""
+        if self.plan_running:
+            self._next_step()
+
+    def _start_goto(self, x, gait='walk'):
+        lo, hi = self._wander_bounds()
+        x = min(max(x, lo - self._idle_w), hi + self._idle_w)
+        if abs(x - self.x) < 3:
+            self._next_step()
+            return
+        self.wander_dir      = 1 if x > self.x else -1
+        self.wander_target_x = x
+        self.wander_gait     = gait
+        want_facing = self.wander_dir < 0   # source art faces left
+        if want_facing != self.facing_right:
+            self.facing_right = want_facing
+            self._set_wander_phase('turn')
+        else:
+            self._set_wander_phase('run_start' if gait == 'run' else 'walk_start')
+
+    def _start_map(self):
+        self.wander_map_walks = random.choice((0, 1, 1, 2))
+        self._set_wander_phase('map_open')
+
+    def _start_rest_sit(self, seconds):
+        self.wander_phase  = None
+        self.sit_quiet     = True
+        self.sit_rest_time = seconds
+        self.sit_phase     = 'sit_down'
+        self.sit_idx       = 0
+        self.sit_timer     = 0.0
+
+    # ── air ──
+    def _start_air(self, kind, vx=0.0, vy=0.0):
+        self.air_anim   = kind
+        self.air_idx    = 0
+        self.air_t      = 0.0
+        self.air_apex_t = None
+        self.air_catch  = None
+        self.vx, self.vy = vx, vy
+        self.support    = None
+
+    def _start_jump(self, tx, ty, style, catch=None):
+        """Ballistic jump so her top-left lands on (tx, ty); with `catch` she
+        grabs a wall at (tx, ty) instead and starts that climb step."""
+        g    = self.GRAVITY
+        lift = {'hop': 0.25, 'jump': 0.45, 'somersault': 0.6, 'walljump': 0.3}[style] * self._idle_h
+        apex = min(self.y, ty) - lift
+        up   = math.sqrt(2.0 * g * max(1.0, self.y - apex))
+        t    = up / g + math.sqrt(2.0 * max(0.0, ty - apex) / g)
+        vx   = (tx - self.x) / t
+        self.wander_phase = None
+        self._start_air(style, vx, -up)
+        if abs(vx) > 1:
+            self.facing_right = vx < 0      # source art faces left
+        if catch:
+            self.air_catch = (t, tx, ty, catch)
+
+    def _tick_air(self, dt):
+        self.air_t += dt
+        k, t = self.air_anim, self.air_t
+        n = len(getattr(self, k + '_frames'))
+        if self.vy >= 0 and self.air_apex_t is None:
+            self.air_apex_t = t
+        falling = self.air_apex_t is not None
+        if k == 'jump':        # 0-4 rising, 5-14 turning over into the fall
+            self.air_idx = (min(n - 1, 5 + int((t - self.air_apex_t) / 0.06)) if falling
+                            else min(4, int(t / 0.06)))
+        elif k == 'hop':       # 1-2 rising, 3-5 coming down
+            self.air_idx = (min(n - 1, 3 + int((t - self.air_apex_t) / 0.08)) if falling
+                            else min(2, 1 + int(t / 0.08)))
+        elif k in ('somersault', 'walljump'):   # lead-in, then the spin loops
+            loop_from = 5 if k == 'somersault' else 2
+            i = int(t / 0.045)
+            self.air_idx = i if i < loop_from else loop_from + (i - loop_from) % (n - loop_from)
+        elif k == 'weak_fall':  # startled, then tumbling
+            i = int(t / 0.07)
+            self.air_idx = i if i < 2 else 2 + (i - 2) % (n - 2)
+        else:                   # fall: play once, hold the last frame
+            self.air_idx = min(n - 1, int(t / 0.07))
+
+    def _air_land(self, impact_vy):
+        kind = self.air_anim
+        self.air_anim  = None
+        self.air_catch = None
+        self.vx = self.vy = 0.0
+        if kind == 'weak_fall':
+            self.land_phase = 'bonk_land'
+        elif kind == 'fall' or impact_vy > 1100:
+            self.land_phase = 'land'
+        else:
+            self.land_phase = 'hop_land'
+        self.land_idx   = 0
+        self.land_timer = 0.0
+
+    # ── walls ──
+    def _wall_pos_x(self, wall_x, side):
+        """Top-left x that puts her hands on a wall at wall_x on her `side`."""
+        fx = self.IDLE_FACE_X * SPRITE_SCALE
+        d  = self.WALL_FACE_D * SPRITE_SCALE
+        if side == 'left':
+            return wall_x + d - fx
+        return wall_x - d - (self._idle_w - fx)
+
+    def _start_climb(self, wall_x, side, stop_y, ledge=None, caught=False):
+        if ledge is not None:
+            p = self._platform(ledge)
+            if p is None:           # the window is gone: give up on this plan
+                self._end_wander()
+                return
+            self.climb_rect = (p.l, p.t, p.r, p.b)
+        else:
+            self.climb_rect = None
+        self.climb_wall_x = wall_x
+        self.climb_side   = side
+        self.climb_stop_y = stop_y
+        self.climb_ledge  = ledge
+        self.facing_right = (side == 'left')   # wall sprites have the wall on their left
+        self.x = self._wall_pos_x(wall_x, side)
+        self.vx = self.vy = 0.0
+        self.support = None
+        # Caught mid-jump: she's already on the wall, so settle first
+        self._set_wander_phase('climb_settle' if caught else 'climb_crouch')
+
+    def _climb_arrive(self):
+        """Reached the top of the climb: pull up onto the ledge, or hold on."""
+        self.y = self.climb_stop_y
+        if self.climb_ledge is not None:
+            self._start_mantle()
+        else:
+            self._set_wander_phase('cling')
+
+    def _start_mantle(self):
+        p = self._platform(self.climb_ledge)
+        if p is None:
+            self._drop('fall')
+            return
+        iw = self._idle_w
+        self.y = p.t - self._idle_h
+        # Pull up over the corner onto the window top (ledge on the wall's side)
+        self.x = p.r - iw * 0.75 if self.climb_side == 'left' else p.l - iw * 0.25
+        self.climb_ledge = None
+        self.climb_rect  = None
+        self._set_wander_phase('mantle')
+
+    # ── surfaces ──
+    def _platform(self, hwnd):
+        for p in self.platforms:
+            if p.hwnd == hwnd:
+                return p
+        return None
+
+    def _monitor_work(self, cx=None):
+        """(left, top, right, bottom) work area of the monitor under x=cx."""
+        if cx is None:
+            cx = self.x + self._idle_w / 2
         for (ml, mt, mr, mb, wl, wt, wr, wb) in self.monitors:
             if ml <= cx <= mr:
-                lo, hi = max(lo, wl), min(hi, wr - self._idle_w)
-                break
-        margin = self._idle_w * 0.3
-        return lo + margin, hi - margin
+                return wl, wt, wr, wb
+        return (self.world_left, self.world_top,
+                self.world_left + self.world_w, self.floor_y + self._idle_h)
+
+    def _wander_bounds(self):
+        """Hard x range (top-left) for walking: the monitor she's on, so she never
+        walks onto a monitor with another floor."""
+        wl, wt, wr, wb = self._monitor_work()
+        lo = max(self.world_left, wl)
+        hi = min(self.world_left + self.world_w, wr) - self._idle_w
+        return lo, hi
+
+    def _surface_span(self):
+        """(lo, hi) span her centre can use on the surface she's standing on."""
+        cx = self.x + self._idle_w / 2
+        wl, wt, wr, wb = self._monitor_work(cx)
+        if self.support is not None:
+            segs = self.support.segs or [(self.support.l, self.support.r)]
+            for a, b in segs:
+                if a <= cx <= b:
+                    return max(a, wl), min(b, wr)
+            return max(self.support.l, wl), min(self.support.r, wr)
+        return wl, wr
+
+    def _surface_bounds(self):
+        """Comfortable x range (top-left) for strolling on her current surface."""
+        lo, hi = self._surface_span()
+        iw = self._idle_w
+        if self.support is not None:
+            a, b = lo - iw / 2 + iw * 0.15, hi - iw / 2 - iw * 0.15
+        else:
+            a, b = lo + iw * 0.3, hi - iw * 1.3
+        return a, b
 
     def _pick_wander_target(self, dist_range):
         """Random (dir, target_x) with enough room, or None if she's boxed in."""
         dmin, dmax = (d * SPRITE_SCALE for d in dist_range)
-        lo, hi = self._wander_bounds()
+        lo, hi = self._surface_bounds()
         dirs = [-1, 1]
         random.shuffle(dirs)
         for d in dirs:
@@ -1718,33 +2218,199 @@ class Hornet:
                 return d, self.x + d * random.uniform(dmin, min(dmax, room))
         return None
 
+    # ── choosing what to do ──
+    def _stroll_plan(self):
+        pick = self._pick_wander_target(self.WANDER_WALK_DIST)
+        if not pick:
+            return None
+        steps = [('goto', pick[1], 'walk')]
+        if random.random() < 0.3:
+            steps.append(('map',))
+        return steps
+
     def _choose_wander(self):
         r = random.random()
-        if r < 0.5:
-            pick = self._pick_wander_target(self.WANDER_WALK_DIST)
-            if pick:
-                self.wander_dir, self.wander_target_x = pick
-                self.wander_then_map = random.random() < 0.3
-                want_facing = self.wander_dir < 0   # source art faces left
-                if want_facing != self.facing_right:
-                    self.facing_right = want_facing
-                    self._set_wander_phase('turn')
+        explore_ok = tray_globals.get('window_platforms', True) and bool(self.platforms)
+        plan = None
+        if self.support is not None:
+            # Up on a window: rest, look around, move on
+            if r < 0.22:
+                plan = [('sit', random.uniform(8.0, 20.0))]
+            elif r < 0.72:
+                if explore_ok and random.random() < 0.4:
+                    plan = self._plan_explore()
+                plan = plan or self._plan_leave()
+            elif r < 0.82:
+                plan = self._stroll_plan()
+            elif r < 0.92:
+                plan = [('map',)]
+        else:
+            if explore_ok and r < 0.35:
+                plan = self._plan_explore()
+            if plan is None:
+                r2 = random.random()
+                if r2 < 0.55:
+                    plan = self._stroll_plan() or [('map',)]
+                elif r2 < 0.85:
+                    plan = [('map',)]
+        if plan:
+            self._start_plan(plan)
+        else:
+            # Just keep standing a while longer
+            self.wander_wait = random.uniform(self.WANDER_IDLE_MIN, self.WANDER_IDLE_MAX)
+
+    def _gait(self, x):
+        return 'run' if abs(x - self.x) > self._idle_w * 2.5 else 'walk'
+
+    def _after_arrival(self):
+        r = random.random()
+        if r < 0.35:
+            return [('sit', random.uniform(8.0, 20.0))]
+        if r < 0.6:
+            return [('map',)]
+        return []
+
+    def _plan_explore(self):
+        """Pick a window to get onto from where she stands and build the moves."""
+        options = []
+        for p in self.platforms:
+            if self.support is not None and p.hwnd == self.support.hwnd:
+                continue
+            for a, b in p.segs:
+                options += self._routes_to(p, a, b)
+        if not options:
+            return None
+        iw = self._idle_w
+        weights = [1.0 / (1.0 + dist / (iw * 4.0)) for _, dist in options]
+        plan = random.choices([o for o, _ in options], weights)[0]
+        return plan + self._after_arrival()
+
+    def _routes_to(self, p, a, b):
+        """Ways onto the visible top segment [a, b] of window p: list of (plan, distance)."""
+        iw, ih = self._idle_w, self._idle_h
+        wl, wt, wr, wb = self._monitor_work()
+        a, b = max(a, wl), min(b, wr)
+        if b - a < iw * 0.9 or p.t - ih < wt + 4:
+            return []                       # too narrow, or no headroom under the screen top
+        feet  = self.y + ih                 # her surface
+        h     = feet - p.t                  # how far up the window top is
+        s_lo, s_hi = self._surface_bounds()
+        s_lo, s_hi = min(s_lo, self.x), max(s_hi, self.x)
+        stop_y = p.t - ih * 0.55            # head over the ledge: time to mantle
+        out = []
+
+        def reachable(x):
+            return s_lo - 2 <= x <= s_hi + 2
+
+        # 1) Jump straight onto the top (low windows, or windows below her)
+        if h <= ih * 1.25:
+            for side in (-1, 1):
+                land_cx = a + iw * 0.45 if side < 0 else b - iw * 0.45
+                for dx in (iw * random.uniform(0.9, 2.0), iw * 0.6):
+                    take_cx = land_cx + side * dx
+                    tx = take_cx - iw / 2
+                    if not reachable(tx):
+                        continue
+                    if h > 0 and a - iw * 0.2 < take_cx < b + iw * 0.2:
+                        continue            # don't jump up through the window from below
+                    style = ('somersault' if h < -ih * 1.5 or dx > iw * 2.6
+                             else 'hop' if abs(h) < ih * 0.35 and dx < iw * 1.6 else 'jump')
+                    out.append(([('goto', tx, self._gait(tx)),
+                                 ('jump', land_cx - iw / 2, p.t - ih, style)],
+                                abs(tx - self.x) + abs(h)))
+                    break
+
+        # 2) Climb one of the window's sides and pull up over the top corner
+        if h > ih * 0.5:
+            sides = []
+            if a <= p.l + iw * 0.1 and b >= p.l + iw * 0.6:
+                sides.append((p.l, 'right', p.l - iw * 0.85, -1))   # wall on her right
+            if b >= p.r - iw * 0.1 and a <= p.r - iw * 0.6:
+                sides.append((p.r, 'left', p.r - iw * 0.15, 1))     # wall on her left
+            for wall_x, side, stand_x, away in sides:
+                if not (wl <= wall_x <= wr):
+                    continue
+                gap = feet - p.b            # window bottom above her feet
+                climb = ('climb', wall_x, side, stop_y, p.hwnd)
+                if gap <= ih * 0.45 and reachable(stand_x):
+                    out.append(([('goto', stand_x, self._gait(stand_x)), climb],
+                                abs(stand_x - self.x) + h))
+                elif gap <= ih * 1.4:
+                    catch_y = p.b - ih * 0.75
+                    if catch_y <= stop_y + ih * 0.3:
+                        continue
+                    take_x = stand_x + away * iw * 0.8
+                    if reachable(take_x):
+                        out.append(([('goto', take_x, self._gait(take_x)),
+                                     ('jump', self._wall_pos_x(wall_x, side), catch_y, 'jump',
+                                      climb)],
+                                    abs(take_x - self.x) + h))
+
+        # 3) Too high: climb the screen edge, then wall-jump across onto it
+        if h > ih * 1.25 and self.support is None:
+            world_r = self.world_left + self.world_w
+            for edge, near, side, toward in ((self.world_left, p.l, 'left', 1),
+                                             (world_r, p.r, 'right', -1)):
+                if not (wl - 1 <= edge <= wr + 1):
+                    continue            # that screen edge isn't on her monitor
+                gap = (near - edge) * toward
+                if not (iw * 0.6 <= gap <= iw * 4.5):
+                    continue
+                corner_ok = (a <= p.l + iw * 0.1) if side == 'left' else (b >= p.r - iw * 0.1)
+                if not corner_ok:
+                    continue
+                stand_x = edge if side == 'left' else edge - iw
+                tall = p.b - p.t > ih * 1.6
+                over_ok = p.t - ih * 1.6 >= wt + ih * 0.35   # room to cling above the window top
+                if not (tall or over_ok):
+                    continue
+                if tall and (not over_ok or random.random() < 0.5):
+                    # Grab the window's side mid-height, then climb it
+                    catch_y = p.t + random.uniform(0.25, 0.5) * (p.b - p.t) - ih * 0.5
+                    cling_y = catch_y - ih * 0.35
+                    wall_side = 'right' if side == 'left' else 'left'
+                    target = (self._wall_pos_x(near, wall_side), catch_y,
+                              ('climb', near, wall_side, stop_y, p.hwnd))
                 else:
-                    self._set_wander_phase('walk_start')
-                return
-        if r < 0.8:   # also the fallback when there's no room to walk
-            self._start_map()
-            return
-        # Otherwise just keep standing a while longer
-        self.wander_wait = random.uniform(self.WANDER_IDLE_MIN, self.WANDER_IDLE_MAX)
+                    cling_y = p.t - ih * 1.6
+                    land_cx = near + toward * iw * 0.45
+                    target = (land_cx - iw / 2, p.t - ih, None)
+                if cling_y < wt or cling_y >= self.y - ih * 0.5:
+                    continue
+                out.append(([('goto', stand_x, 'run'),
+                             ('climb', edge, side, cling_y, None),
+                             ('walljump',) + target],
+                            abs(stand_x - self.x) + h + iw * 2))
+        return out
 
-    def _start_map(self):
-        self.wander_map_walks = random.choice((0, 1, 1, 2))
-        self._set_wander_phase('map_open')
+    def _plan_leave(self):
+        """From a window top: jump down to the floor beside it, or step off the edge."""
+        if self.support is None:
+            return None
+        iw, ih = self._idle_w, self._idle_h
+        lo, hi = self._surface_span()
+        wl, wt, wr, wb = self._monitor_work()
+        sides = [(-1, lo), (1, hi)]
+        random.shuffle(sides)
+        for d, edge in sides:
+            land_cx = edge + d * iw * random.uniform(0.9, 2.5)
+            if not (wl + iw * 0.6 <= land_cx <= wr - iw * 0.6):
+                continue
+            ground_y = self._floor_for_x(land_cx)
+            drop = ground_y - self.y
+            if random.random() < 0.35:
+                # Just walk off the edge and drop
+                return [('goto', edge + d * iw * 0.6 - iw / 2, 'walk')]
+            take_x = edge - d * iw * 0.35 - iw / 2
+            style = 'somersault' if drop > ih * 2.0 else 'jump'
+            return [('goto', take_x, self._gait(take_x)),
+                    ('jump', land_cx - iw / 2, ground_y, style)]
+        return None
 
-    def _wander_walk_step(self, dt, stride_px, fps):
+    # ── per-tick ──
+    def _wander_walk_step(self, dt, stride_px, fps, factor=1.0):
         """Move toward the target; returns True once it's reached."""
-        speed = stride_px * SPRITE_SCALE / fps
+        speed = stride_px * SPRITE_SCALE / fps * factor
         self.x += self.wander_dir * speed * dt
         lo, hi = self._wander_bounds()
         reached = ((self.wander_dir < 0 and self.x <= self.wander_target_x) or
@@ -1754,15 +2420,40 @@ class Hornet:
             self.x = min(max(self.x, lo), hi)
         return reached
 
+    def _ground_speed(self):
+        if self.wander_phase in ('run_start', 'run', 'run_stop'):
+            return self.RUN_STRIDE_PX * SPRITE_SCALE / self.RUN_FPS
+        return self.WALK_STRIDE_PX * SPRITE_SCALE / self.WANDER_WALK_FPS
+
     def _update_wander(self, dt):
         self.vx = self.vy = 0.0
-        self.y  = self.floor_y
         p = self.wander_phase
 
-        if p == 'walk':
-            if self._wander_walk_step(dt, self.WALK_STRIDE_PX, self.WANDER_WALK_FPS):
-                self._set_wander_phase('walk_stop')
+        if p in self.GROUND_PHASES:
+            if self.floor_y > self.y + 2:
+                # Walked off the edge of a window: drop, and pick the plan up after landing
+                vx = self.wander_dir * self._ground_speed() * 0.7 if p in ('walk', 'run') else 0.0
+                self.wander_phase = None
+                self._start_air('fall', vx, 0.0)
                 return
+            self.y = self.floor_y
+
+        if p in ('walk', 'run'):
+            stride, fps = ((self.RUN_STRIDE_PX, self.RUN_FPS) if p == 'run'
+                           else (self.WALK_STRIDE_PX, self.WANDER_WALK_FPS))
+            if self._wander_walk_step(dt, stride, fps):
+                nxt = self.plan[0][0] if self.plan else None
+                if p == 'run' and nxt in ('jump', 'climb'):
+                    self._next_step()       # keep the momentum into the jump / wall
+                else:
+                    self._set_wander_phase('run_stop' if p == 'run' else 'walk_stop')
+                return
+        elif p == 'run_start':
+            self._wander_walk_step(dt, self.RUN_STRIDE_PX, self.RUN_FPS, 0.5)
+        elif p == 'run_stop':
+            self.x += self.wander_dir * self._ground_speed() * 0.3 * dt
+            lo, hi = self._wander_bounds()
+            self.x = min(max(self.x, lo), hi)
         elif p == 'map_walk':
             if self._wander_walk_step(dt, self.MAP_WALK_STRIDE_PX, self.MAP_WALK_FPS):
                 self._set_wander_phase('map_idle')
@@ -1785,6 +2476,13 @@ class Hornet:
                 else:
                     self._set_wander_phase('map_close')
                 return
+        elif p in self.WALL_PHASES:
+            self.x = self._wall_pos_x(self.climb_wall_x, self.climb_side)
+            if p == 'climb_leap':
+                # Rise only during the leap: fast off the wall, easing into the cling
+                count, fps, _ = self._wander_seq_info(p)
+                t = min(1.0, (self.wander_idx + self.wander_timer / fps) / count)
+                self.y = self.leap_y0 - self.leap_h * (1.0 - (1.0 - t) ** 2)
 
         # Animation
         count, fps, loops = self._wander_seq_info(p)
@@ -1799,21 +2497,106 @@ class Hornet:
             self.wander_idx = 0
             return
         # One-shot finished: move on
-        if p in ('turn', 'walk_start'):
-            # TurnWalk already ends mid-stride, so it flows straight into the walk
+        if p == 'turn':
+            # TurnWalk already ends mid-stride, so it flows straight into the gait
+            self._set_wander_phase('run' if self.wander_gait == 'run' else 'walk')
+        elif p == 'walk_start':
             self._set_wander_phase('walk')
-        elif p == 'walk_stop':
-            if self.wander_then_map and tray_globals.get('wander', True):
-                self._start_map()
-            else:
-                self._end_wander()
+        elif p == 'run_start':
+            self._set_wander_phase('run')
         elif p == 'map_open':
             self._set_wander_phase('map_idle')
             self.wander_map_time = random.uniform(3.0, 8.0)
         elif p == 'map_turn':
             self._set_wander_phase('map_walk')
-        else:  # map_close
-            self._end_wander()
+        elif p == 'climb_crouch':
+            self.leap_y0 = self.y
+            self.leap_h  = min(self._idle_h * self.CLIMB_HOP, self.y - self.climb_stop_y)
+            self._set_wander_phase('climb_leap')
+        elif p == 'climb_leap':
+            self.y = self.leap_y0 - self.leap_h
+            self._set_wander_phase('climb_settle')
+        elif p == 'climb_settle':
+            if self.y <= self.climb_stop_y + 1:
+                self._climb_arrive()
+            else:
+                self._set_wander_phase('climb_crouch')
+        elif p == 'cling':
+            if self.plan and self.plan[0][0] == 'walljump':
+                self._next_step()
+            else:
+                self._end_wander()
+                self._start_air('fall')
+        elif p == 'walljump_antic':
+            tx, ty, catch = self.wj_target
+            self.wj_target = None
+            self._start_jump(tx, ty, 'walljump', catch)
+        elif p == 'mantle':
+            self._set_wander_phase('mantle_land')
+        else:  # walk_stop, run_stop, map_close, mantle_land
+            self._next_step()
+
+    # ── window platforms ──
+    def _floor_here(self) -> float:
+        """Top-left y she'd stand at below her feet: the highest window top under
+        her centre (one-way: only tops at or below her feet count), else the
+        monitor floor. Sets floor_plat to the window it belongs to."""
+        cx   = self.x + self._idle_w / 2
+        feet = self.y + self._idle_h
+        best = self._floor_for_x(cx) + self._idle_h
+        best_p = None
+        sup = self.support.hwnd if self.support is not None else None
+        for p in self.platforms:
+            if p.t < feet - 3 or p.t >= best:
+                continue
+            if p.hwnd == sup:
+                ok = p.l <= cx <= p.r          # keep standing even if another window covers it
+            else:
+                ok = any(a <= cx <= b for a, b in p.segs)
+            if ok:
+                best, best_p = p.t, p
+        self.floor_plat = best_p
+        return best - self._idle_h
+
+    def set_platforms(self, plats):
+        """New window scan. If the window she's on (or climbing) moved, she falls
+        off; if it closed or was minimized, she drops in a tumble."""
+        self.platforms = plats
+        by_hwnd = {p.hwnd: p for p in plats}
+        if self.support is not None:
+            old, new = self.support, by_hwnd.get(self.support.hwnd)
+            cx = self.x + self._idle_w / 2
+            if new is None:
+                self._drop('weak_fall')
+            elif (abs(new.t - old.t) > 2
+                  or (abs(new.l - old.l) > 2 and abs(new.r - old.r) > 2)
+                  or not (new.l <= cx <= new.r)):
+                self._drop('fall')
+            else:
+                self.support = new
+        if self.climb_rect is not None and self.climb_ledge is not None:
+            new = by_hwnd.get(self.climb_ledge)
+            if new is None:
+                self._drop('weak_fall')
+            elif any(abs(u - v) > 2 for u, v in zip((new.l, new.t, new.r, new.b), self.climb_rect)):
+                self._drop('fall')
+
+    def _drop(self, kind):
+        """The ground (or wall) went away under her: stop everything and fall."""
+        if self.dragging or self.walk_in_phase is not None:
+            return
+        if self.sit_phase in ('sit_loop', 'sit_outro'):
+            self.ev_music_stop = True
+        self.sit_phase   = None
+        self.sit_quiet   = False
+        self.sleep_phase = None
+        self.taunt_phase = None
+        self.land_phase  = None
+        self.glide_phase = None
+        self.climb_ledge = None
+        self.climb_rect  = None
+        self._cancel_wander()
+        self._start_air(kind, 0.0, -160.0 if kind == 'weak_fall' else 0.0)
 
     # ── physics ───────────────────────────────────────────────────────────────
     def update(self, dt, mx=None, my=None):
@@ -1823,13 +2606,15 @@ class Hornet:
         if self.taunt_cooldown_timer > 0:
             self.taunt_cooldown_timer -= dt
 
-        # Refresh floor for whichever monitor sits under her right now
+        # Refresh the floor under her: monitor floor or a window top below her feet
         if self.monitors:
-            self.floor_y = self._floor_for_x(self.x + self._idle_w / 2)
+            self.floor_y = self._floor_here()
+            self.support = self.floor_plat if self.y >= self.floor_y - 1 else None
 
         # Give her a breather after any interaction before she wanders off
         if (self.walk_in_phase or self.sleep_phase or self.taunt_phase or self.sit_phase
-                or self.land_phase or self.glide_phase or self.dragging or self._pending):
+                or self.land_phase or self.glide_phase or self.dragging or self._pending
+                or self.air_anim):
             self.wander_wait = max(self.wander_wait, self.WANDER_IDLE_MIN)
 
         # Walk-in entrance overrides all other state until it completes.
@@ -1899,6 +2684,7 @@ class Hornet:
                 return
             # Wander brain: after standing still a while, pick something to do
             if (tray_globals.get('wander', True) and not self._pending
+                    and not self.plan_running and self.air_anim is None
                     and abs(self.vx) < 5 and self.vy == 0.0):
                 self.wander_wait -= dt
                 if self.wander_wait <= 0:
@@ -1908,7 +2694,9 @@ class Hornet:
         else:
             self.inactivity_timer = 0.0
             self.wander_wait = max(self.wander_wait, self.WANDER_IDLE_MIN)
-        if abs(self.vx) > 30:
+        if self.air_anim is not None:
+            self._tick_air(dt)
+        elif abs(self.vx) > 30:
             self.facing_right = self.vx > 0
         self.vy += self.GRAVITY * dt
         self.x  += self.vx * dt
@@ -1916,7 +2704,10 @@ class Hornet:
         soft = tray_globals.get('land_mode', 'bounce') in ('soft', 'glide')
         if self.y >= self.floor_y:
             self.y = self.floor_y
-            if soft and abs(self.vy) * self.BOUNCE_DAMP >= self.MIN_BOUNCE_VY:
+            if self.air_anim is not None:
+                # Her own jumps and drops always land on their feet, never bounce
+                self._air_land(self.vy)
+            elif soft and abs(self.vy) * self.BOUNCE_DAMP >= self.MIN_BOUNCE_VY:
                 self.vy         = 0.0
                 self.vx         = 0.0
                 self.land_phase = 'land'
@@ -1927,7 +2718,14 @@ class Hornet:
                 self.vx *= self.FRICTION
                 if abs(self.vy) < self.MIN_BOUNCE_VY:
                     self.vy = 0.0
-        if self.x < self.world_left:
+        if self.air_anim is not None:
+            # Jumping on her own: screen edges just stop her (she may start a little
+            # past the edge after a wall jump, so only block moving further out)
+            if self.x < self.world_left and self.vx < 0:
+                self.x, self.vx = self.world_left, 0.0
+            elif self.x > world_right - self._idle_w and self.vx > 0:
+                self.x, self.vx = float(world_right - self._idle_w), 0.0
+        elif self.x < self.world_left:
             self.x = self.world_left
             if soft and abs(self.vx) * self.BOUNCE_DAMP >= 50.0:
                 self._start_wall_cling('left')
@@ -1939,11 +2737,21 @@ class Hornet:
             else:
                 self.x  = float(world_right - self._idle_w)
                 self.vx = -abs(self.vx) * self.BOUNCE_DAMP
-        if self.y < self.world_top:
+        if self.y < self.world_top and self.air_anim is None:
             self.y  = self.world_top;  self.vy = abs(self.vy) * self.BOUNCE_DAMP
+        # Grab a wall mid-jump once the jump reaches it
+        if self.air_anim is not None and self.air_catch is not None:
+            t, tx, ty, climb = self.air_catch
+            if self.air_t >= t:
+                self.air_anim  = None
+                self.air_catch = None
+                self.y = ty
+                self._start_climb(*climb[1:], caught=True)
+                return
         # Umbrella glide: once she's falling fast enough from high enough, open it
         if (tray_globals.get('land_mode', 'bounce') == 'glide'
                 and self.land_phase is None
+                and self.air_anim in (None, 'fall', 'weak_fall')
                 and self.vy >= self.GLIDE_TRIGGER_VY
                 and self.floor_y - self.y >= self.GLIDE_MIN_HEIGHT):
             self._start_glide()
@@ -1976,12 +2784,15 @@ class Hornet:
         return -int(self._idle_h * IDLE_Y_OFFSET)
 
     def _sit_x_offset(self, frame: pygame.Surface) -> int:
-        centred = self.sitting or self.gliding or self.wandering or self.walking_in
+        centred = (self.sitting or self.gliding or self.wandering or self.walking_in
+                   or self.air_anim is not None or self.land_phase in self.CENTRED_LANDS)
         return (self._idle_w - frame.get_width()) // 2 if centred else 0
 
     def _glide_y_offset(self, frame: pygame.Surface) -> int:
-        # Umbrella frames are top-aligned to the idle head; the needle hangs below
-        return frame.get_height() - self._idle_h if self.gliding else 0
+        # Umbrella and wall frames are top-aligned to the idle head (the needle hangs
+        # below while gliding; the body moves along the wall while climbing)
+        top = self.gliding or self.wander_phase in self.WALL_PHASES
+        return frame.get_height() - self._idle_h if top else 0
 
     def display_frame(self) -> pygame.Surface:
         """Current frame as it will actually be rendered (h-flip applied)."""
@@ -2038,6 +2849,8 @@ class Hornet:
             return ('land', self.land_phase, self.land_idx, self.facing_right)
         if self.wander_phase:
             return ('wander', self.wander_phase, self.wander_idx, self.facing_right)
+        if self.air_anim:
+            return ('air', self.air_anim, self.air_idx, self.facing_right)
         if self.glide_phase:
             return ('glide', self.glide_phase, self.glide_idx, self.facing_right)
         if self.taunt_phase:
@@ -2096,6 +2909,7 @@ _CONFIG_DEFAULTS = {
     'wander_idle_min':  4.0,
     'wander_idle_max':  12.0,
     'wander_walk_fps':  0.07,
+    'window_platforms': True,
 }
 
 _SPAWN_MODES = ('fall', 'walk_from_right', 'walk_from_left')
@@ -2224,6 +3038,7 @@ def load_config(apply_volume=False):
     tray_globals['land_mode']   = lm if lm in _LAND_MODES else 'bounce'
     tray_globals['drag_pendulum'] = bool(cfg['drag_pendulum'])
     tray_globals['wander']      = bool(cfg['wander'])
+    tray_globals['window_platforms'] = bool(cfg['window_platforms'])
     tray_globals['cloak_color'] = CLOAK_COLOR
     sm = str(cfg['spawn_mode'])
     if sm not in _SPAWN_MODES:
@@ -2323,6 +3138,10 @@ def _show_context_menu(x, y, hornet_ref, on_quit=None):
                 tray_globals['wander'] = not tray_globals['wander']
                 _save_config_key('wander', tray_globals['wander'])
 
+            def on_toggle_window_platforms():
+                tray_globals['window_platforms'] = not tray_globals['window_platforms']
+                _save_config_key('window_platforms', tray_globals['window_platforms'])
+
             def on_reload_config():
                 load_config(apply_volume=True)
 
@@ -2400,6 +3219,10 @@ def _show_context_menu(x, y, hornet_ref, on_quit=None):
             wander_var = tk.BooleanVar(value=tray_globals['wander'])
             pop.add_checkbutton(label='Wander', variable=wander_var,
                                 command=close_run(on_toggle_wander))
+            if PLAT == 'Windows':
+                platforms_var = tk.BooleanVar(value=tray_globals['window_platforms'])
+                pop.add_checkbutton(label='Climb Windows', variable=platforms_var,
+                                    command=close_run(on_toggle_window_platforms))
             pop.add_separator()
             pop.add_command(label='Reload Config', command=close_run(on_reload_config))
             if PLAT == 'Windows':
@@ -2485,6 +3308,10 @@ def _create_tray_icon(hwnd, hornet_ref):
         tray_globals['wander'] = not tray_globals['wander']
         _save_config_key('wander', tray_globals['wander'])
 
+    def on_toggle_window_platforms(icon=None, item=None):
+        tray_globals['window_platforms'] = not tray_globals['window_platforms']
+        _save_config_key('window_platforms', tray_globals['window_platforms'])
+
     def on_cloak_preset(color_val):
         def handler(icon=None, item=None):
             _set_cloak_color(color_val)
@@ -2556,6 +3383,8 @@ def _create_tray_icon(hwnd, hornet_ref):
                      checked=lambda item: tray_globals['drag_pendulum']),
             MenuItem('Wander', on_toggle_wander,
                      checked=lambda item: tray_globals['wander']),
+            MenuItem('Climb Windows', on_toggle_window_platforms,
+                     checked=lambda item: tray_globals['window_platforms']),
             MenuItem('Reload Config', on_reload_config),
             MenuItem('Reset Topmost', on_reset_topmost),
             MenuItem('Quit', on_quit),
@@ -2986,8 +3815,17 @@ def main():
         tray_thread.start()
 
     running = True
+    platform_timer = 0.0
     while running and tray_globals['running']:
         dt = min(clock.tick(60) / 1000.0, 0.05)
+
+        # Window tops she can stand on (re-scanned a few times a second)
+        if PLAT == 'Windows':
+            platform_timer -= dt
+            if platform_timer <= 0:
+                platform_timer = 0.25
+                hornet.set_platforms(_win_scan_platforms()
+                                     if tray_globals['window_platforms'] else [])
 
         # On Windows, GetCursorPos works even when WS_EX_TRANSPARENT is set
         # (pygame.mouse.get_pos() returns stale coords when the window is click-through)
@@ -3073,6 +3911,7 @@ def main():
             hornet.map_idle_frames   = new_seqs['map_idle']
             hornet.map_walk_frames   = new_seqs['map_walk']
             hornet.map_turn_frames   = new_seqs['map_turn']
+            hornet.bind_extra_frames(new_seqs)
             old_floor_y    = hornet.floor_y
             hornet.floor_y = hornet._floor_for_x(hornet.x + hornet._idle_w / 2)
             hornet.y      += hornet.floor_y - old_floor_y

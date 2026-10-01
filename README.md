@@ -36,6 +36,7 @@
 - **Cloak recoloring** -  choose from color presets or a custom hex color for Hornet's cloak, from the tray icon
 - **Spawn animation** -  choose whether Hornet falls in from the top or walks in from the left/right edge of the screen on launch
 - **Wandering** -  when left alone she walks around on her own, turns, stops, pulls out her map to read it, and sometimes strolls while reading (toggle from the menu)
+- **Climbing windows** (Windows) -  your open windows become platforms: she lands on them, climbs their sides, wall-jumps off the screen edge to reach high ones, sits on top, and jumps back down. Move a window and she falls off; close it and she tumbles down
 
 ---
 
@@ -150,6 +151,29 @@ Drifting into a screen edge while gliding still triggers the wall cling / wall s
 
 ---
 
+## Climbing Windows
+
+On Windows, the top edge of every visible, non-maximized window is a platform (only the parts not hidden behind other windows). She can be thrown onto them and lands there, and while wandering she goes exploring:
+
+| Route | When | Animations |
+|---|---|---|
+| Jump on top | the window top is low (or below her) | run, `jump` / `hop` / `somersault`, `hop_land` |
+| Climb the side | the window reaches down near her | `climb` (repeated scramble leaps), `wall_mantle`, `mantle_land` |
+| Jump and grab the side | the window floats a little above her | `jump`, then climb the side |
+| Screen edge + wall jump | the window is too high, near a screen edge | climb the edge, `climb_cling`, `walljump_antic`, `walljump`, then land on top or grab its side |
+
+Up there she strolls, reads her map, or sits quietly with her legs over the edge (`sit_rest`, no music; click her to make her play). Then she jumps down to the taskbar, steps off the edge, or moves on to another window.
+
+| Window event | Reaction |
+|---|---|
+| Moved (or resized from under her) | Falls off -  `fall`, then the landing animation |
+| Closed / minimized | Tumbles -  `weak_fall`, then `bonk_land` |
+| Covered by another window | She keeps standing |
+
+Windows whose top is closer to the top of the screen than her height are skipped (there'd be no room for her). Toggle with **Climb Windows** in the menu, or `window_platforms` in `config.json`.
+
+---
+
 ## Taunt
 
 If the cursor hovers near Hornet for `taunt_hover_time` seconds (default 2.5 s) while she is idle or on the ground, she gets annoyed and plays her taunt animation.
@@ -227,6 +251,7 @@ All values hot-reload instantly via **Tray → Reload Config**.
 | `wander_idle_min` | `4.0` | Minimum seconds she stands still between activities |
 | `wander_idle_max` | `12.0` | Maximum seconds she stands still between activities |
 | `wander_walk_fps` | `0.07` | Seconds per walk frame; walk speed follows it so her feet never slide |
+| `window_platforms` | `true` | Windows only -  stand on, climb and jump between open windows |
 
 ---
 
@@ -260,6 +285,15 @@ All values hot-reload instantly via **Tray → Reload Config**.
 | `assets/sprites/map_idle/` | Standing and reading the map (6 frames) |
 | `assets/sprites/map_walk/` | Walking while reading the map (10 frames) |
 | `assets/sprites/map_turn/` | Turn-around while holding the map (2 frames) |
+| `assets/sprites/run/`, `run_start/`, `run_stop/` | Running to a window (10 / 8 / 6 frames) |
+| `assets/sprites/jump/`, `hop/`, `somersault/` | Jumps (15 / 6 / 13 frames) |
+| `assets/sprites/hop_land/` | Light landing after a jump (6 frames) |
+| `assets/sprites/climb/`, `climb_cling/` | Wall scramble leap (crouch, leap, settle; 7 frames) and cling (8 frames) |
+| `assets/sprites/walljump_antic/`, `walljump/` | Wall jump with somersault (3 / 14 frames) |
+| `assets/sprites/wall_mantle/`, `mantle_land/` | Pulling up over a window's corner (2 / 6 frames) |
+| `assets/sprites/fall/` | Falling off a moved window (7 frames) |
+| `assets/sprites/weak_fall/`, `bonk_land/` | Tumbling off a closed window and landing (6 / 7 frames) |
+| `assets/sprites/sit_rest/` | Quiet sitting loop on a window (42 frames) |
 | `assets/audio/needoline.mp3` | Background music track |
 | `assets/logo/` | App icon (PNG + ICO) |
 
