@@ -25,6 +25,7 @@
 - **Full sitting sequence** -  sit-down → pause → intro → looping play → outro → pause → get-up, with smooth position transitions
 - **Sleep** -  after 5 minutes of inactivity on the ground, Hornet falls asleep; a small "z" floats above her head while she sleeps; click her to wake up
 - **Soft landing** -  optional mode where Hornet doesn't bounce; plays a landing animation on the floor, and wall-slide / wall-cling animations against screen edges
+- **Umbrella glide** -  optional landing mode: drop her from high up and she opens her cloak like an umbrella, drifting down slowly with a gentle sway (soft landing still applies on walls and the floor)
 - **Taunt** -  hover the cursor near Hornet long enough and she'll get annoyed and taunt you; has a cooldown
 - **Music** -  plays randomised segments of *Needoline* during the sitting loop; stops when she stands
 - **Velocity-reactive sprites** -  fast-fall and tumble sprites trigger based on speed and direction
@@ -114,15 +115,37 @@ The "z" overlay can be disabled by setting `sleep_z` to `false` in `config.json`
 
 ---
 
-## Soft Landing
+## Landing Modes
 
-When `soft_land` is enabled in `config.json`, Hornet does not bounce on impact. Instead:
+Pick a mode from the **Landing** menu (tray or right-click), or set `land_mode` in `config.json`:
+
+| Mode | Behaviour |
+|---|---|
+| `bounce` | Default -  Hornet bounces off the floor and walls |
+| `soft` | No bouncing; landing and wall-cling animations play instead (see below) |
+| `glide` | Same as `soft`, but high falls open the umbrella and she floats down |
+
+### Soft Landing
+
+In `soft` and `glide` modes, Hornet does not bounce on impact. Instead:
 
 | Situation | Sprites | Notes |
 |---|---|---|
 | Hitting the floor | `land/land_1–10.png` | Landing animation plays once, then transitions to idle |
 | Sliding down a wall | `wall_slide/wall_slide_1–9.png` | Plays while descending along a screen edge |
 | Reaching the wall bottom | `wall_cling/wall_cling_1–4.png` | Cling animation plays once before transitioning to idle |
+
+### Umbrella Glide
+
+In `glide` mode, once Hornet is falling fast and is at least `glide_min_height` px above the floor:
+
+| Phase | Sprites | Notes |
+|---|---|---|
+| Opening | `umbrella_open/umbrella_open_1–5.png` | Cloak inflates into an umbrella; her fall slows down |
+| Floating | `umbrella_float/umbrella_float_1–11.png` | Looping drift at `glide_fall_vy`, swaying side to side |
+| Closing | `umbrella_close/umbrella_close_1–2.png` | Plays when the needle touches the floor, then the soft landing |
+
+Drifting into a screen edge while gliding still triggers the wall cling / wall slide.
 
 ---
 
@@ -187,7 +210,11 @@ All values hot-reload instantly via **Tray → Reload Config**.
 | `volume` | `1.0` | Music volume (0.0 – 1.0) |
 | `scale` | `100` | Sprite scale percentage (50 = half size, 200 = double) |
 | `sleep_z` | `true` | Show a floating "z" above Hornet's head while she sleeps |
-| `soft_land` | `true` | Enable soft landing / wall-slide instead of bouncing |
+| `land_mode` | `"bounce"` | Landing mode -  `"bounce"`, `"soft"`, or `"glide"` (replaces the old `soft_land` toggle) |
+| `glide_fall_vy` | `140.0` | Fall speed (px/s) while gliding with the umbrella |
+| `glide_min_height` | `250.0` | Minimum height (px) above the floor for the umbrella to open |
+| `glide_sway_amp` | `30.0` | Side-to-side sway amplitude (px) while gliding |
+| `glide_fps` | `0.07` | Seconds per frame for the umbrella float loop |
 | `land_fps` | `0.04` | Seconds per frame for landing and wall-cling animations |
 | `wall_slide_fps` | `0.08` | Seconds per frame for the wall-slide animation |
 | `taunt_fps` | `0.06` | Seconds per frame for the taunt animation |
@@ -216,6 +243,9 @@ All values hot-reload instantly via **Tray → Reload Config**.
 | `assets/sprites/land/` | Soft landing animation (10 frames) |
 | `assets/sprites/wall_slide/` | Wall-slide animation (9 frames) |
 | `assets/sprites/wall_cling/` | Wall-cling animation (4 frames) |
+| `assets/sprites/umbrella_open/` | Umbrella glide opening (5 frames) |
+| `assets/sprites/umbrella_float/` | Umbrella glide float loop (11 frames) |
+| `assets/sprites/umbrella_close/` | Umbrella glide closing (2 frames) |
 | `assets/sprites/taunt/` | Taunt animation (19 frames + 8-frame silk effect) |
 | `assets/sprites/sleep_wake/` | Sleep / wake transition (14 frames, played forward and reversed) |
 | `assets/sprites/walk/` | Walk-in entrance animation (10 frames) |

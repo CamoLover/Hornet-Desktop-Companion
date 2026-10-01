@@ -336,7 +336,7 @@ tray_globals = {
     'auto_random_song': True,  # If False, always use current_song when sitting
     'hwnd': None,
     'sleep_z': True,           # Show floating Z's while sleeping
-    'soft_land': False,        # Play landing/wall-cling animations instead of bouncing
+    'land_mode': 'bounce',     # 'bounce' | 'soft' | 'glide' (soft + umbrella glide on high falls)
     'drag_pendulum': True,     # Swing sprite around grip while dragged
     'cloak_color': 'default',  # Cloak hue: 'default' or '#RRGGBB'
     'spawn_mode': 'fall',      # 'fall' | 'walk_from_right' | 'walk_from_left'
@@ -521,6 +521,9 @@ def load_raw_assets():
         'taunt_silk': _num_sorted(_resource('assets/sprites/taunt/taunt_silk_*.png')),
         'walk':       _num_sorted(_resource('assets/sprites/walk/walk_*.png')),
         'walk_stop':  _num_sorted(_resource('assets/sprites/walk_stop/walkstop_*.png')),
+        'umbrella_open':  _num_sorted(_resource('assets/sprites/umbrella_open/umbrella_open_*.png')),
+        'umbrella_float': _num_sorted(_resource('assets/sprites/umbrella_float/umbrella_float_*.png')),
+        'umbrella_close': _num_sorted(_resource('assets/sprites/umbrella_close/umbrella_close_*.png')),
     }
     singles = {
         'FAST_FALL':       _resource('assets/sprites/fast_fall/hornet_fast_fall.png'),
@@ -709,6 +712,18 @@ class Hornet:
     WALK_STOP_FPS  = 0.08   # seconds per frame for the walk-in stop animation
     WALK_SPEED     = 240.0  # px/sec while walking on-screen at the entrance
 
+    # Umbrella glide (land_mode == 'glide'): high falls open the umbrella and drift down.
+    GLIDE_FPS          = 0.07   # seconds per frame for the float loop
+    GLIDE_OPEN_FPS     = 0.05   # seconds per frame for the open (inflate) animation
+    GLIDE_CLOSE_FPS    = 0.06   # seconds per frame for the close (deflate) animation
+    GLIDE_FALL_VY      = 140.0  # px/sec terminal fall speed while gliding
+    GLIDE_MIN_HEIGHT   = 250.0  # px above the floor required to open the umbrella
+    GLIDE_TRIGGER_VY   = 250.0  # px/sec of downward speed before the umbrella opens
+    GLIDE_DRAG         = 4.0    # 1/sec: how fast vy eases toward GLIDE_FALL_VY
+    GLIDE_AIR_DRAG     = 1.2    # 1/sec: decay of horizontal momentum while gliding
+    GLIDE_SWAY_AMP     = 30.0   # px side-to-side sway amplitude
+    GLIDE_SWAY_PERIOD  = 2.4    # seconds per full sway cycle
+
     # Grab-swing pendulum: sprite pivots around the grip point while dragged.
     DRAG_SWING_DAMPING   = 0.16    # damping ratio; <1 = oscillates before settling
     DRAG_SWING_IMPULSE_K = 0.0022  # rad/s of ang-vel per (px/s) of pivot-accel impulse
@@ -750,6 +765,9 @@ class Hornet:
         self.taunt_silk_frames  = seqs['taunt_silk']
         self.walk_frames        = seqs['walk']
         self.walk_stop_frames   = seqs['walk_stop']
+        self.umbrella_open_frames  = seqs['umbrella_open']
+        self.umbrella_float_frames = seqs['umbrella_float']
+        self.umbrella_close_frames = seqs['umbrella_close']
         self.floor_y            = floor_y
 
         self.state        = 'IDLE'
@@ -777,6 +795,13 @@ class Hornet:
         self.land_idx   = 0
         self.land_timer = 0.0
         self.wall_side  = None  # 'left' | 'right'  — which wall she clung to
+
+        # glide_phase: None|'open'|'float'|'close'
+        self.glide_phase = None
+        self.glide_idx   = 0
+        self.glide_timer = 0.0
+        self.glide_t     = 0.0   # time since the umbrella opened (drives the sway)
+        self.glide_drift = 0.0   # horizontal momentum carried into the glide
 
         # taunt state
         self.taunt_phase         = None   # None | 'taunting'
@@ -833,6 +858,10 @@ class Hornet:
         return self.walk_in_phase is not None
 
     @property
+    def gliding(self):
+        return self.glide_phase is not None
+
+    @property
     def _idle_w(self): return self.idle_frames[0].get_width()
     @property
     def _idle_h(self): return self.idle_frames[0].get_height()
@@ -858,6 +887,12 @@ class Hornet:
         if self.land_phase == 'wall_land':
             # sleep_wake frames 11-14 are indices 10-13
             return self.sleep_wake_frames[10 + self.land_idx]
+        if self.glide_phase == 'open':
+            return self.umbrella_open_frames[self.glide_idx]
+        if self.glide_phase == 'float':
+            return self.umbrella_float_frames[self.glide_idx]
+        if self.glide_phase == 'close':
+            return self.umbrella_close_frames[self.glide_idx]
         if self.taunt_phase == 'taunting':
             return self.taunt_frames[self.taunt_idx]
         if self.sit_phase == 'sit_down':
@@ -954,6 +989,7 @@ class Hornet:
                 self.taunt_phase = None
                 self.taunt_idx   = 0
                 self.taunt_timer = 0.0
+                self.glide_phase = None
                 self.sit_phase = 'sit_down'
                 self.sit_idx   = 0
                 self.sit_timer = 0.0
@@ -969,7 +1005,8 @@ class Hornet:
         self.sit_timer = 0.0
 
     def _start_drag(self, mx, my):
-        self.land_phase = None
+        self.land_phase  = None
+        self.glide_phase = None
         # Grabbing during the walk-in entrance cancels it so the user is in control.
         self.walk_in_phase = None
         self.walk_in_idx   = 0
@@ -1141,7 +1178,7 @@ class Hornet:
 
     # ── state ─────────────────────────────────────────────────────────────────
     def _upd_state(self):
-        if self.sitting or self.dragging or self.land_phase is not None:
+        if self.sitting or self.dragging or self.land_phase is not None or self.gliding:
             self.state = 'IDLE'; return
         spd = math.hypot(self.vx, self.vy)
         if spd < 80 or self.vy <= 0:
@@ -1304,6 +1341,113 @@ class Hornet:
                 self.land_idx += 1
                 if self.land_idx >= 4:  # sleep_wake frames 11-14 = 4 frames
                     self.land_phase = None  # back to idle
+
+    def _start_wall_cling(self, side):
+        world_right = self.world_left + self.world_w
+        self.vx           = 0.0
+        self.vy           = 0.0
+        self.wall_side    = side
+        self.facing_right = (side == 'left')
+        self.land_phase   = 'wall_cling'
+        self.land_idx     = 0
+        self.land_timer   = 0.0
+        if side == 'left':
+            self.x = self.world_left
+        else:
+            self.x = float(world_right - self.wall_cling_frames[0].get_width())
+
+    # ── umbrella glide ────────────────────────────────────────────────────────
+    def _start_glide(self):
+        self.glide_phase = 'open'
+        self.glide_idx   = 0
+        self.glide_timer = 0.0
+        self.glide_t     = 0.0
+        self.glide_drift = self.vx
+
+    def _glide_bottom(self) -> float:
+        """Lowest visible pixel of the current glide frame, in the same space as
+        the idle frame's bottom edge (self.y + idle_h). The needle tip hangs below
+        her feet, so it touches the floor first."""
+        return self.y + self.current_frame().get_bounding_rect().bottom
+
+    def _update_glide(self, dt):
+        p = self.glide_phase
+        world_right = self.world_left + self.world_w
+        self.inactivity_timer = 0.0
+
+        # Animation
+        self.glide_timer += dt
+        if p == 'open':
+            if self.glide_timer >= self.GLIDE_OPEN_FPS:
+                self.glide_timer = 0.0
+                self.glide_idx += 1
+                if self.glide_idx >= len(self.umbrella_open_frames):
+                    self.glide_phase = 'float'
+                    self.glide_idx   = 0
+        elif p == 'float':
+            if self.glide_timer >= self.GLIDE_FPS:
+                self.glide_timer = 0.0
+                self.glide_idx = (self.glide_idx + 1) % len(self.umbrella_float_frames)
+        elif p == 'close':
+            if self.glide_timer >= self.GLIDE_CLOSE_FPS:
+                self.glide_timer = 0.0
+                if self.glide_idx < len(self.umbrella_close_frames) - 1:
+                    self.glide_idx += 1
+
+        # Physics
+        self.glide_drift *= math.exp(-self.GLIDE_AIR_DRAG * dt)
+        if self.glide_phase == 'close':
+            # Umbrella folded: regular gravity for the last drop to the floor
+            self.vy += self.GRAVITY * dt
+            self.vx  = self.glide_drift
+        else:
+            self.glide_t += dt
+            self.vy += (self.GLIDE_FALL_VY - self.vy) * (1.0 - math.exp(-self.GLIDE_DRAG * dt))
+            # Sway eases in so she doesn't jerk sideways the moment it opens
+            w    = 2.0 * math.pi / self.GLIDE_SWAY_PERIOD
+            ramp = min(1.0, self.glide_t / 0.8)
+            self.vx = self.glide_drift + self.GLIDE_SWAY_AMP * w * math.cos(w * self.glide_t) * ramp
+        # Face the carried momentum only; the sway alone must not flip her back and forth
+        if abs(self.glide_drift) > 30:
+            self.facing_right = self.glide_drift > 0
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+
+        if self.y < self.world_top:
+            self.y  = self.world_top
+            self.vy = max(self.vy, 0.0)
+
+        # Walls: she still clings, however gently she drifts into them
+        if self.x < self.world_left:
+            self.glide_phase = None
+            self._start_wall_cling('left')
+            return
+        if self.x > world_right - self._idle_w:
+            self.glide_phase = None
+            self._start_wall_cling('right')
+            return
+
+        # Floor: fold the umbrella when the needle touches, land when she does
+        floor_line = self.floor_y + self._idle_h
+        if self._glide_bottom() >= floor_line:
+            if self.glide_phase != 'close':
+                self.glide_phase = 'close'
+                self.glide_idx   = 0
+                self.glide_timer = 0.0
+            else:
+                self._end_glide_land()
+        elif self.y > self.floor_y + self._idle_h:
+            # Safety net: never sink through the floor (e.g. floor rose under her)
+            self._end_glide_land()
+
+    def _end_glide_land(self):
+        self.glide_phase = None
+        self.y          = self.floor_y
+        self.vx         = 0.0
+        self.vy         = 0.0
+        self.land_phase = 'land'
+        self.land_idx   = 0
+        self.land_timer = 0.0
 
     def _spawn_z_particle(self):
         sw = self.sleep_frame.get_width()
@@ -1494,6 +1638,9 @@ class Hornet:
         if self.land_phase is not None:
             self._update_land(dt)
             return
+        if self.glide_phase is not None:
+            self._update_glide(dt)
+            return
         self.idle_timer += dt
         if self.idle_timer >= self.IDLE_FPS:
             self.idle_timer = 0.0
@@ -1532,7 +1679,7 @@ class Hornet:
         self.vy += self.GRAVITY * dt
         self.x  += self.vx * dt
         self.y  += self.vy * dt
-        soft = tray_globals.get('soft_land', False)
+        soft = tray_globals.get('land_mode', 'bounce') in ('soft', 'glide')
         if self.y >= self.floor_y:
             self.y = self.floor_y
             if soft and abs(self.vy) * self.BOUNCE_DAMP >= self.MIN_BOUNCE_VY:
@@ -1549,30 +1696,23 @@ class Hornet:
         if self.x < self.world_left:
             self.x = self.world_left
             if soft and abs(self.vx) * self.BOUNCE_DAMP >= 50.0:
-                self.vx         = 0.0
-                self.vy         = 0.0
-                self.wall_side  = 'left'
-                self.facing_right = True
-                self.land_phase = 'wall_cling'
-                self.land_idx   = 0
-                self.land_timer = 0.0
+                self._start_wall_cling('left')
             else:
                 self.vx = abs(self.vx) * self.BOUNCE_DAMP
         elif self.x > world_right - self._idle_w:
             if soft and abs(self.vx) * self.BOUNCE_DAMP >= 50.0:
-                self.vx         = 0.0
-                self.vy         = 0.0
-                self.wall_side  = 'right'
-                self.facing_right = False
-                self.land_phase = 'wall_cling'
-                self.land_idx   = 0
-                self.land_timer = 0.0
-                self.x = float(world_right - self.wall_cling_frames[0].get_width())
+                self._start_wall_cling('right')
             else:
                 self.x  = float(world_right - self._idle_w)
                 self.vx = -abs(self.vx) * self.BOUNCE_DAMP
         if self.y < self.world_top:
             self.y  = self.world_top;  self.vy = abs(self.vy) * self.BOUNCE_DAMP
+        # Umbrella glide: once she's falling fast enough from high enough, open it
+        if (tray_globals.get('land_mode', 'bounce') == 'glide'
+                and self.land_phase is None
+                and self.vy >= self.GLIDE_TRIGGER_VY
+                and self.floor_y - self.y >= self.GLIDE_MIN_HEIGHT):
+            self._start_glide()
         self._upd_state()
 
     # ── draw ──────────────────────────────────────────────────────────────────
@@ -1602,7 +1742,11 @@ class Hornet:
         return -int(self._idle_h * IDLE_Y_OFFSET)
 
     def _sit_x_offset(self, frame: pygame.Surface) -> int:
-        return (self._idle_w - frame.get_width()) // 2 if self.sitting else 0
+        return (self._idle_w - frame.get_width()) // 2 if (self.sitting or self.gliding) else 0
+
+    def _glide_y_offset(self, frame: pygame.Surface) -> int:
+        # Umbrella frames are top-aligned to the idle head; the needle hangs below
+        return frame.get_height() - self._idle_h if self.gliding else 0
 
     def display_frame(self) -> pygame.Surface:
         """Current frame as it will actually be rendered (h-flip applied)."""
@@ -1619,7 +1763,8 @@ class Hornet:
             return
         frame = self.display_frame()
         draw_x = int(self.x) + self._sit_x_offset(frame)
-        draw_y = int(self.y) + self._idle_h - frame.get_height() + self._idle_y_offset() + self._sit_offset()
+        draw_y = (int(self.y) + self._idle_h - frame.get_height() + self._idle_y_offset()
+                  + self._sit_offset() + self._glide_y_offset(frame))
         surface.blit(frame, (draw_x, draw_y))
 
     def _blit_rotated(self, surface, pivot_x, pivot_y):
@@ -1656,6 +1801,8 @@ class Hornet:
             return ('sleep', self.sleep_phase, self.sleep_idx, self.facing_right)
         if self.land_phase:
             return ('land', self.land_phase, self.land_idx, self.facing_right)
+        if self.glide_phase:
+            return ('glide', self.glide_phase, self.glide_idx, self.facing_right)
         if self.taunt_phase:
             return ('taunt', self.taunt_idx, self.facing_right)
         if self.sit_phase:
@@ -1668,7 +1815,8 @@ class Hornet:
         """Top-left (x, y) of the current frame as drawn."""
         frame = self.display_frame()
         draw_x = int(self.x) + self._sit_x_offset(frame)
-        draw_y = int(self.y) + self._idle_h - frame.get_height() + self._idle_y_offset() + self._sit_offset()
+        draw_y = (int(self.y) + self._idle_h - frame.get_height() + self._idle_y_offset()
+                  + self._sit_offset() + self._glide_y_offset(frame))
         return draw_x, draw_y
 
 
@@ -1696,16 +1844,24 @@ _CONFIG_DEFAULTS = {
     'land_fps':       0.04,
     'wall_slide_fps': 0.08,
     'sleep_z':        True,
-    'soft_land':      False,
+    'land_mode':      'bounce',
     'drag_pendulum':  True,
     'taunt_fps':      0.05,
     'taunt_cooldown': 120.0,
     'taunt_hover_time': 2.5,
     'cloak_color': 'default',
     'spawn_mode':  'fall',
+    'glide_fall_vy':    140.0,
+    'glide_min_height': 250.0,
+    'glide_sway_amp':   30.0,
+    'glide_fps':        0.07,
 }
 
 _SPAWN_MODES = ('fall', 'walk_from_right', 'walk_from_left')
+_LAND_MODES  = ('bounce', 'soft', 'glide')
+_LAND_MODE_LABELS = (('Bounce', 'bounce'),
+                     ('Soft Landing', 'soft'),
+                     ('Umbrella Glide', 'glide'))
 
 SPRITE_SCALE     = 1.0    # set by load_config()
 CLOAK_COLOR      = 'default'  # set by load_config(); 'default' or '#RRGGBB'
@@ -1744,6 +1900,14 @@ def _set_spawn_mode(mode):
     _save_config_key('spawn_mode', mode)
 
 
+def _set_land_mode(mode):
+    """Set landing mode at runtime and persist."""
+    if mode not in _LAND_MODES:
+        return
+    tray_globals['land_mode'] = mode
+    _save_config_key('land_mode', mode)
+
+
 def _save_config_key(key, value):
     """Persist a single key back to config.json without touching other values."""
     cfg = {}
@@ -1768,6 +1932,9 @@ def load_config(apply_volume=False):
             with open(CONFIG_PATH) as f:
                 user = json.load(f)
             cfg.update({k: v for k, v in user.items() if k in _CONFIG_DEFAULTS})
+            # Legacy: 'soft_land' bool predates 'land_mode'
+            if 'land_mode' not in user and user.get('soft_land'):
+                cfg['land_mode'] = 'soft'
         except Exception as e:
             print(f"[config] failed to load {CONFIG_PATH}: {e}")
     else:
@@ -1791,6 +1958,10 @@ def load_config(apply_volume=False):
     Hornet.TAUNT_FPS       = float(cfg['taunt_fps'])
     Hornet.TAUNT_COOLDOWN  = float(cfg['taunt_cooldown'])
     Hornet.TAUNT_HOVER_TIME = float(cfg['taunt_hover_time'])
+    Hornet.GLIDE_FALL_VY    = float(cfg['glide_fall_vy'])
+    Hornet.GLIDE_MIN_HEIGHT = float(cfg['glide_min_height'])
+    Hornet.GLIDE_SWAY_AMP   = float(cfg['glide_sway_amp'])
+    Hornet.GLIDE_FPS        = float(cfg['glide_fps'])
     new_scale = max(0.1, float(cfg['scale']) / 100.0)
     new_cloak = str(cfg['cloak_color'])
     if apply_volume and (abs(new_scale - SPRITE_SCALE) > 1e-6 or new_cloak != CLOAK_COLOR):
@@ -1805,7 +1976,8 @@ def load_config(apply_volume=False):
     SLEEP_Y_OFFSET = float(cfg['sleep_y_offset'])
     tray_globals['volume']      = float(cfg['volume'])
     tray_globals['sleep_z']     = bool(cfg['sleep_z'])
-    tray_globals['soft_land']   = bool(cfg['soft_land'])
+    lm = str(cfg['land_mode'])
+    tray_globals['land_mode']   = lm if lm in _LAND_MODES else 'bounce'
     tray_globals['drag_pendulum'] = bool(cfg['drag_pendulum'])
     tray_globals['cloak_color'] = CLOAK_COLOR
     sm = str(cfg['spawn_mode'])
@@ -1894,9 +2066,9 @@ def _show_context_menu(x, y, hornet_ref, on_quit=None):
                     hornet_ref[0].z_spawn_timer = 0.0
                 _save_config_key('sleep_z', tray_globals['sleep_z'])
 
-            def on_toggle_soft_land():
-                tray_globals['soft_land'] = not tray_globals['soft_land']
-                _save_config_key('soft_land', tray_globals['soft_land'])
+            def on_land_mode(val):
+                def cb(): _set_land_mode(val)
+                return cb
 
             def on_toggle_drag_pendulum():
                 tray_globals['drag_pendulum'] = not tray_globals['drag_pendulum']
@@ -1962,13 +2134,17 @@ def _show_context_menu(x, y, hornet_ref, on_quit=None):
                                     command=close_run(on_spawn_mode(val)))
             pop.add_cascade(label='Spawn Mode', menu=spm)
 
+            lm = tk.Menu(pop, tearoff=0)
+            land_var = tk.StringVar(value=tray_globals.get('land_mode', 'bounce'))
+            for label, val in _LAND_MODE_LABELS:
+                lm.add_radiobutton(label=label, value=val, variable=land_var,
+                                   command=close_run(on_land_mode(val)))
+            pop.add_cascade(label='Landing', menu=lm)
+
             pop.add_separator()
             sleep_z_var = tk.BooleanVar(value=tray_globals['sleep_z'])
             pop.add_checkbutton(label="Sleep Z's", variable=sleep_z_var,
                                 command=close_run(on_toggle_sleep_z))
-            soft_land_var = tk.BooleanVar(value=tray_globals['soft_land'])
-            pop.add_checkbutton(label='Soft Landing', variable=soft_land_var,
-                                command=close_run(on_toggle_soft_land))
             drag_pendulum_var = tk.BooleanVar(value=tray_globals['drag_pendulum'])
             pop.add_checkbutton(label='Drag Pendulum', variable=drag_pendulum_var,
                                 command=close_run(on_toggle_drag_pendulum))
@@ -2044,9 +2220,10 @@ def _create_tray_icon(hwnd, hornet_ref):
             hornet_ref[0].z_spawn_timer = 0.0
         _save_config_key('sleep_z', tray_globals['sleep_z'])
 
-    def on_toggle_soft_land(icon=None, item=None):
-        tray_globals['soft_land'] = not tray_globals['soft_land']
-        _save_config_key('soft_land', tray_globals['soft_land'])
+    def on_land_mode(mode):
+        def handler(icon=None, item=None):
+            _set_land_mode(mode)
+        return handler
 
     def on_toggle_drag_pendulum(icon=None, item=None):
         tray_globals['drag_pendulum'] = not tray_globals['drag_pendulum']
@@ -2102,16 +2279,23 @@ def _create_tray_icon(hwnd, hornet_ref):
                  checked=_spawn_checked('walk_from_left'), radio=True),
     ]
 
+    def _land_checked(val):
+        return lambda item: tray_globals.get('land_mode', 'bounce') == val
+
+    land_items = [
+        MenuItem(label, on_land_mode(val), checked=_land_checked(val), radio=True)
+        for label, val in _LAND_MODE_LABELS
+    ]
+
     def build_menu():
         return Menu(
             MenuItem('Songs', Menu(*song_items)),
             MenuItem('Volume', Menu(*volume_items)),
             MenuItem('Cloak Color', Menu(*cloak_items)),
             MenuItem('Spawn Mode', Menu(*spawn_items)),
+            MenuItem('Landing', Menu(*land_items)),
             MenuItem('Sleep Z\'s', on_toggle_sleep_z,
                      checked=lambda item: tray_globals['sleep_z']),
-            MenuItem('Soft Landing', on_toggle_soft_land,
-                     checked=lambda item: tray_globals['soft_land']),
             MenuItem('Drag Pendulum', on_toggle_drag_pendulum,
                      checked=lambda item: tray_globals['drag_pendulum']),
             MenuItem('Reload Config', on_reload_config),
@@ -2623,6 +2807,9 @@ def main():
             hornet.taunt_silk_frames = new_seqs['taunt_silk']
             hornet.walk_frames       = new_seqs['walk']
             hornet.walk_stop_frames  = new_seqs['walk_stop']
+            hornet.umbrella_open_frames  = new_seqs['umbrella_open']
+            hornet.umbrella_float_frames = new_seqs['umbrella_float']
+            hornet.umbrella_close_frames = new_seqs['umbrella_close']
             old_floor_y    = hornet.floor_y
             hornet.floor_y = hornet._floor_for_x(hornet.x + hornet._idle_w / 2)
             hornet.y      += hornet.floor_y - old_floor_y
