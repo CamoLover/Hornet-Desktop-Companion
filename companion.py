@@ -1034,6 +1034,7 @@ class Hornet:
         self.climb_ledge  = None     # hwnd of the window to mantle onto at the top
         self.leap_y0      = 0.0      # y where the current scramble leap started
         self.leap_h       = 0.0      # height of the current scramble leap
+        self.leaps_left   = 0        # scramble leaps still needed to reach the top
         self.climb_rect   = None     # that window's rect when she started climbing it
         self.wj_target    = None     # (x, y, catch) for the queued wall jump
 
@@ -2135,8 +2136,16 @@ class Hornet:
         self.x = self._wall_pos_x(wall_x, side)
         self.vx = self.vy = 0.0
         self.support = None
+        # Split the climb into even leaps so none is a full launch for a tiny step;
+        # a short bit left (grabbed right under the ledge) is just a pull-up
+        rise = self.y - stop_y
+        hop  = self._idle_h * self.CLIMB_HOP
+        self.leaps_left = 0 if rise < self._idle_h * 0.4 else max(1, round(rise / hop))
         # Caught mid-jump: she's already on the wall, so settle first
-        self._set_wander_phase('climb_settle' if caught else 'climb_crouch')
+        if caught or self.leaps_left == 0:
+            self._set_wander_phase('climb_settle')
+        else:
+            self._set_wander_phase('climb_crouch')
 
     def _climb_arrive(self):
         """Reached the top of the climb: pull up onto the ledge, or hold on."""
@@ -2321,7 +2330,8 @@ class Hornet:
                     break
 
         # 2) Climb one of the window's sides and pull up over the top corner
-        if h > ih * 0.5:
+        #    (lower windows are simply jumped onto)
+        if h > ih * 1.0:
             sides = []
             if a <= p.l + iw * 0.1 and b >= p.l + iw * 0.6:
                 sides.append((p.l, 'right', p.l - iw * 0.85, -1))   # wall on her right
@@ -2511,13 +2521,14 @@ class Hornet:
             self._set_wander_phase('map_walk')
         elif p == 'climb_crouch':
             self.leap_y0 = self.y
-            self.leap_h  = min(self._idle_h * self.CLIMB_HOP, self.y - self.climb_stop_y)
+            self.leap_h  = max(0.0, self.y - self.climb_stop_y) / max(1, self.leaps_left)
+            self.leaps_left -= 1
             self._set_wander_phase('climb_leap')
         elif p == 'climb_leap':
             self.y = self.leap_y0 - self.leap_h
             self._set_wander_phase('climb_settle')
         elif p == 'climb_settle':
-            if self.y <= self.climb_stop_y + 1:
+            if self.leaps_left <= 0:
                 self._climb_arrive()
             else:
                 self._set_wander_phase('climb_crouch')
@@ -2784,15 +2795,17 @@ class Hornet:
         return -int(self._idle_h * IDLE_Y_OFFSET)
 
     def _sit_x_offset(self, frame: pygame.Surface) -> int:
+        if self.wander_phase in self.WALL_PHASES:
+            # Wall frames are cropped at the hands/feet: put that edge on the wall
+            wx = self.climb_wall_x if self.climb_side == 'left' else self.climb_wall_x - frame.get_width()
+            return int(wx) - int(self.x)
         centred = (self.sitting or self.gliding or self.wandering or self.walking_in
                    or self.air_anim is not None or self.land_phase in self.CENTRED_LANDS)
         return (self._idle_w - frame.get_width()) // 2 if centred else 0
 
     def _glide_y_offset(self, frame: pygame.Surface) -> int:
-        # Umbrella and wall frames are top-aligned to the idle head (the needle hangs
-        # below while gliding; the body moves along the wall while climbing)
-        top = self.gliding or self.wander_phase in self.WALL_PHASES
-        return frame.get_height() - self._idle_h if top else 0
+        # Umbrella frames are top-aligned to the idle head; the needle hangs below
+        return frame.get_height() - self._idle_h if self.gliding else 0
 
     def display_frame(self) -> pygame.Surface:
         """Current frame as it will actually be rendered (h-flip applied)."""
