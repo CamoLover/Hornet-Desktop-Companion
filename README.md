@@ -34,9 +34,9 @@
 - **Pixel-perfect transparency** -  no black box; uses the SHAPE extension on Linux or layered windows on Windows
 - **Throwable** -  drag and release with momentum to fling her
 - **Cloak recoloring** -  choose from color presets or a custom hex color for Hornet's cloak, from the tray icon
-- **Spawn animation** -  choose whether Hornet falls in from the top or walks in from the left/right edge of the screen on launch
+- **Spawn animation** -  choose whether Hornet falls in from the top or runs in from the left/right edge of the screen on launch
 - **Wandering** -  when left alone she walks around on her own, turns, stops, pulls out her map to read it, and sometimes strolls while reading (toggle from the menu)
-- **Climbing windows** (Windows) -  your open windows become platforms: she lands on them, climbs their sides, wall-jumps off the screen edge to reach high ones, sits on top, and jumps back down. Move a window and she falls off; close it and she tumbles down
+- **Climbing windows** (Windows, Linux X11) -  your open windows become platforms: she lands on them, climbs their sides, wall-jumps off the screen edge to reach high ones, sits on top, and jumps back down. Move a window and she falls off; close it and she tumbles down
 
 ---
 
@@ -199,7 +199,7 @@ Right-click (Windows) or click (Linux) the tray icon to access:
 | **Cloak Color → [preset]** | Recolor Hornet's cloak; takes effect immediately |
 | **Cloak Color → Custom…** | Pick any color via a color picker dialog |
 | **Spawn Mode → Fall (Default)** | Hornet drops in from the top on launch |
-| **Spawn Mode → Walk from Right / Left** | Hornet walks in from the chosen screen edge on launch |
+| **Spawn Mode → Walk from Right / Left** | Hornet runs in from the chosen screen edge and skids to a stop on launch |
 | **Reload Config** | Hot-reload `config.json` -  applies all values instantly, including scale |
 | **Reset Topmost** | Force the window back to the top of the z-order (Windows only) |
 | **Quit** | Close the companion |
@@ -251,7 +251,7 @@ All values hot-reload instantly via **Tray → Reload Config**.
 | `wander_idle_min` | `4.0` | Minimum seconds she stands still between activities |
 | `wander_idle_max` | `12.0` | Maximum seconds she stands still between activities |
 | `wander_walk_fps` | `0.07` | Seconds per walk frame; walk speed follows it so her feet never slide |
-| `window_platforms` | `true` | Windows only -  stand on, climb and jump between open windows |
+| `window_platforms` | `true` | Windows and Linux (X11) -  stand on, climb and jump between open windows |
 
 ---
 
@@ -278,14 +278,14 @@ All values hot-reload instantly via **Tray → Reload Config**.
 | `assets/sprites/umbrella_close/` | Umbrella glide closing (2 frames) |
 | `assets/sprites/taunt/` | Taunt animation (19 frames + 8-frame silk effect) |
 | `assets/sprites/sleep_wake/` | Sleep / wake transition (14 frames, played forward and reversed) |
-| `assets/sprites/walk/` | Walk cycle, used by the walk-in and wandering (10 frames) |
+| `assets/sprites/walk/` | Walk cycle, used while wandering (10 frames) |
 | `assets/sprites/walk_stop/` | Walk-to-idle transition, played backwards to start walking (5 frames) |
 | `assets/sprites/turn/` | Turn-around while walking (3 frames) |
 | `assets/sprites/map_open/` | Pull out the map, played backwards to put it away (2 frames) |
 | `assets/sprites/map_idle/` | Standing and reading the map (6 frames) |
 | `assets/sprites/map_walk/` | Walking while reading the map (10 frames) |
 | `assets/sprites/map_turn/` | Turn-around while holding the map (2 frames) |
-| `assets/sprites/run/`, `run_start/`, `run_stop/` | Running to a window (10 / 8 / 6 frames) |
+| `assets/sprites/run/`, `run_start/`, `run_stop/` | Running in on launch and to windows (10 / 8 / 6 frames) |
 | `assets/sprites/jump/`, `hop/`, `somersault/` | Jumps (15 / 6 / 13 frames) |
 | `assets/sprites/hop_land/` | Light landing after a jump (6 frames) |
 | `assets/sprites/climb/`, `climb_cling/` | Wall scramble leap (crouch, leap, settle; 7 frames) and cling (8 frames) |
@@ -310,6 +310,8 @@ All values hot-reload instantly via **Tray → Reload Config**.
 - Requires a compositor (picom, kwin, mutter) for background transparency. Without one, the SHAPE extension is used for pixel-perfect clipping.
 - Always-on-top is set via EWMH `_NET_WM_STATE_ABOVE`. If it doesn't stick: `wmctrl -r "Hornet" -b add,above`
 - On Wayland: `SDL_VIDEODRIVER=x11 python companion.py`
+- Window climbing works on X11 sessions with an EWMH window manager (GNOME, KDE, Xfce, Cinnamon, i3, Openbox...). It's turned off on Wayland, where native windows can't be seen by other apps.
+- Multi-monitor layouts are read from `xrandr --listmonitors`. X11 only reports one desktop-wide work area, so a panel on one monitor also trims the floor of the others.
 
 ### macOS
 - pygame transparency is unreliable on macOS -  the window may show a black background.

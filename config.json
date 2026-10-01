@@ -23,5 +23,7 @@
     "taunt_cooldown": 120.0,
     "taunt_hover_time": 2.5,
     "cloak_color": "default",
-    "spawn_mode": "walk_from_left"
+    "spawn_mode": "walk_from_left",
+    "drag_pendulum": true,
+    "land_mode": "glide"
 }

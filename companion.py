@@ -109,6 +109,56 @@ def _workarea_linux():
     return None
 
 
+def _linux_enum_monitors(workarea):
+    """Per-monitor bounds from `xrandr --listmonitors`, same tuple layout as
+    _win_enum_monitors(). X11 only exposes one work area for the whole desktop,
+    so each monitor's work area is its intersection with that rectangle."""
+    try:
+        out = subprocess.check_output(['xrandr', '--listmonitors'], text=True,
+                                      stderr=subprocess.DEVNULL)
+    except Exception:
+        return []
+    monitors = []
+    # " 0: +*eDP-1 1920/344x1080/194+0+0  eDP-1"
+    for m in re.finditer(r'(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)', out):
+        w, h, x, y = map(int, m.groups())
+        ml, mt, mr, mb = x, y, x + w, y + h
+        wl, wt, wr, wb = ml, mt, mr, mb
+        if workarea:
+            ax, ay, aw, ah = workarea
+            il, it = max(ml, ax), max(mt, ay)
+            ir, ib = min(mr, ax + aw), min(mb, ay + ah)
+            if ir > il and ib > it:
+                wl, wt, wr, wb = il, it, ir, ib
+        monitors.append((ml, mt, mr, mb, wl, wt, wr, wb))
+    return monitors
+
+
+def _linux_enum_monitors(workarea):
+    """Per-monitor bounds from `xrandr --listmonitors`, same tuple layout as
+    _win_enum_monitors. X11 only exposes one desktop-wide work area, so each
+    monitor's work area is its rect clipped to that."""
+    try:
+        out = subprocess.check_output(['xrandr', '--listmonitors'],
+                                      text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return []
+    monitors = []
+    # " 0: +*DP-1 2560/597x1440/336+0+0  DP-1"
+    for m in re.finditer(r'(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)', out):
+        w, h, x, y = map(int, m.groups())
+        l, t, r, b = x, y, x + w, y + h
+        wl, wt, wr, wb = l, t, r, b
+        if workarea:
+            ax, ay, aw, ah = workarea
+            cl, ct = max(l, ax), max(t, ay)
+            cr, cb = min(r, ax + aw), min(b, ay + ah)
+            if cr > cl and cb > ct:
+                wl, wt, wr, wb = cl, ct, cr, cb
+        monitors.append((l, t, r, b, wl, wt, wr, wb))
+    return monitors
+
+
 def _linux_set_above(wid: int):
     """Send _NET_WM_STATE ClientMessage to add ABOVE (proper EWMH protocol for mapped windows)."""
     try:
@@ -260,6 +310,13 @@ if PLAT == 'Linux':
     wa = _workarea_linux()
     USABLE_H = (wa[1] + wa[3]) if wa else SCREEN_H  # y + h = bottom of usable area
 
+    # --- per-monitor bounds (the X screen spans all monitors from 0,0) ---
+    MONITORS = _linux_enum_monitors(wa)
+    if SCREEN_W:
+        VIRT_W, VIRT_H = SCREEN_W, SCREEN_H
+    if SCREEN_W:
+        MONITORS = _linux_enum_monitors(wa)
+
     # --- ARGB visual (skip on Wayland) ---
     if not os.environ.get('WAYLAND_DISPLAY'):
         vis = _find_argb_visual()
@@ -339,7 +396,8 @@ tray_globals = {
     'land_mode': 'bounce',     # 'bounce' | 'soft' | 'glide' (soft + umbrella glide on high falls)
     'drag_pendulum': True,     # Swing sprite around grip while dragged
     'wander': True,            # Walk around / read the map on her own while idle
-    'window_platforms': True,  # Stand on / climb desktop windows (Windows only)
+    'window_platforms': True,  # Stand on / climb desktop windows (Windows, Linux X11)
+    'window_platforms_ok': PLAT == 'Windows',  # Linux: set once the X11 scanner connects
     'cloak_color': 'default',  # Cloak hue: 'default' or '#RRGGBB'
     'spawn_mode': 'fall',      # 'fall' | 'walk_from_right' | 'walk_from_left'
 }
@@ -366,7 +424,8 @@ class X11ShapeManager:
     ShapeInput    = 2
     ShapeSet      = 0
 
-    def __init__(self):
+    def __init__(self, input_only=False):
+        self._input_only = input_only   # ARGB visual: compositor handles the look
         self._xlib   = None
         self._xext   = None
         self._dpy    = None
@@ -386,6 +445,30 @@ class X11ShapeManager:
             return True
         except Exception:
             return False
+
+    def pointer(self):
+        """Global cursor position. pygame's goes stale while the pointer is
+        outside the input shape (i.e. most of the time)."""
+        if not self._dpy:
+            return None
+        x = self._xlib
+        if not hasattr(self, '_qp_root'):
+            x.XDefaultRootWindow.restype  = ctypes.c_ulong
+            x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            x.XQueryPointer.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+                ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint)]
+            self._qp_root = x.XDefaultRootWindow(self._dpy)
+        root, child = ctypes.c_ulong(), ctypes.c_ulong()
+        rx, ry, wx, wy, mask = (ctypes.c_int(), ctypes.c_int(), ctypes.c_int(),
+                                ctypes.c_int(), ctypes.c_uint())
+        if not x.XQueryPointer(self._dpy, self._qp_root, ctypes.byref(root),
+                               ctypes.byref(child), ctypes.byref(rx), ctypes.byref(ry),
+                               ctypes.byref(wx), ctypes.byref(wy), ctypes.byref(mask)):
+            return None
+        return rx.value, ry.value
 
     def disconnect(self):
         if self._dpy:
@@ -424,6 +507,11 @@ class X11ShapeManager:
     def update(self, x: int, y: int, surface: pygame.Surface, key):
         if not self._dpy:
             return
+        w, h = surface.get_size()
+        if self._input_only:
+            self._set_input_rect(x, y, w, h)
+            self._xlib.XFlush(self._dpy)
+            return
         if key not in self._bitmaps:
             bm = self._make_bitmap(surface)
             if bm:
@@ -432,7 +520,6 @@ class X11ShapeManager:
                 return
 
         bm = self._bitmaps[key]
-        w, h = surface.get_size()
 
         # Visual: pixel-perfect alpha mask
         self._xext.XShapeCombineMask.argtypes = [
@@ -442,6 +529,10 @@ class X11ShapeManager:
             self._dpy, self._win, self.ShapeBounding,
             x, y, bm, self.ShapeSet)
 
+        self._set_input_rect(x, y, w, h)
+        self._xlib.XFlush(self._dpy)
+
+    def _set_input_rect(self, x, y, w, h):
         # Input: bounding rectangle (easier to drag)
         class XRect(ctypes.Structure):
             _fields_ = [('x',ctypes.c_short),('y',ctypes.c_short),
@@ -454,8 +545,6 @@ class X11ShapeManager:
         self._xext.XShapeCombineRectangles(
             self._dpy, self._win, self.ShapeInput,
             0, 0, ctypes.byref(rect), 1, self.ShapeSet, 0)
-
-        self._xlib.XFlush(self._dpy)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -601,7 +690,12 @@ def _win_scan_platforms():
     except Exception as e:
         print(f"[platforms] scan failed: {e}")
         return []
+    return _platforms_from_stack(wins)
 
+
+def _platforms_from_stack(wins):
+    """(id, l, t, r, b, is_plat) tuples, topmost first → Platforms whose top
+    edges are clipped by the windows stacked above them."""
     plats = []
     for i, (h, l, t, r, b, is_plat) in enumerate(wins):
         if not is_plat:
@@ -621,6 +715,168 @@ def _win_click_through(hwnd, enable: bool):
     u = ctypes.windll.user32
     s = u.GetWindowLongW(hwnd, -20)
     u.SetWindowLongW(hwnd, -20, (s | 0x20) if enable else (s & ~0x20))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Linux (X11) window platforms
+# ─────────────────────────────────────────────────────────────────────────────
+
+class X11PlatformScanner:
+    """Linux counterpart of _win_scan_platforms: reads the EWMH stacking list
+    (_NET_CLIENT_LIST_STACKING) on its own X connection. Needs an EWMH window
+    manager (any mainstream X11 desktop has one)."""
+
+    def __init__(self, own_wid=0):
+        self._dpy = None
+        self._own_wid = own_wid
+        try:
+            x = ctypes.CDLL(ctypes.util.find_library('X11'))
+            x.XOpenDisplay.restype  = ctypes.c_void_p
+            x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            x.XDefaultRootWindow.restype  = ctypes.c_ulong
+            x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            x.XInternAtom.restype  = ctypes.c_ulong
+            x.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+            x.XGetWindowProperty.restype  = ctypes.c_int
+            x.XGetWindowProperty.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long,
+                ctypes.c_long, ctypes.c_int, ctypes.c_ulong,
+                ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                ctypes.POINTER(ctypes.c_void_p)]
+            x.XGetGeometry.restype  = ctypes.c_int
+            x.XGetGeometry.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
+                ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)]
+            x.XTranslateCoordinates.restype  = ctypes.c_int
+            x.XTranslateCoordinates.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
+                ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong)]
+            x.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            x.XFree.argtypes = [ctypes.c_void_p]
+            # Windows can close between listing and querying them; Xlib's default
+            # error handler would exit() the whole app on that BadWindow.
+            self._err_proto = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+            self._err_handler = self._err_proto(lambda _d, _e: 0)
+            x.XSetErrorHandler.restype  = ctypes.c_void_p
+            x.XSetErrorHandler.argtypes = [ctypes.c_void_p]
+            self._x = x
+            self._dpy = x.XOpenDisplay(None)
+            if not self._dpy:
+                return
+            self._root = x.XDefaultRootWindow(self._dpy)
+            self._atoms = {n: x.XInternAtom(self._dpy, n.encode(), 0) for n in (
+                '_NET_CLIENT_LIST_STACKING', '_NET_CURRENT_DESKTOP', '_NET_WM_DESKTOP',
+                '_NET_WM_PID', '_NET_WM_STATE', '_NET_WM_STATE_HIDDEN',
+                '_NET_WM_STATE_FULLSCREEN', '_NET_WM_STATE_MAXIMIZED_VERT',
+                '_NET_WM_STATE_MAXIMIZED_HORZ', '_NET_WM_WINDOW_TYPE',
+                '_NET_WM_WINDOW_TYPE_DESKTOP', '_NET_WM_WINDOW_TYPE_NORMAL',
+                '_NET_WM_WINDOW_TYPE_DIALOG', '_NET_FRAME_EXTENTS', '_GTK_FRAME_EXTENTS')}
+        except Exception as e:
+            print(f"[platforms] X11 scanner unavailable: {e}")
+            self._dpy = None
+
+    @property
+    def available(self):
+        return bool(self._dpy)
+
+    def close(self):
+        if self._dpy:
+            self._x.XCloseDisplay(self._dpy)
+            self._dpy = None
+
+    def _prop(self, win, name):
+        """32-bit (CARDINAL/ATOM/WINDOW) property as a list of ints, [] if unset."""
+        typ, fmt = ctypes.c_ulong(), ctypes.c_int()
+        n, after, data = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
+        ok = self._x.XGetWindowProperty(
+            self._dpy, win, self._atoms[name], 0, 1024, 0, 0,   # AnyPropertyType
+            ctypes.byref(typ), ctypes.byref(fmt), ctypes.byref(n),
+            ctypes.byref(after), ctypes.byref(data))
+        if ok != 0 or not data.value:
+            return []
+        try:
+            if fmt.value != 32:
+                return []
+            # Format-32 data is handed back as an array of C longs
+            return list(ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))[:n.value])
+        finally:
+            self._x.XFree(data)
+
+    def _frame_rect(self, win):
+        """Visible frame in root coordinates (WM decorations in, CSD shadows out)."""
+        x = self._x
+        root, gx, gy = ctypes.c_ulong(), ctypes.c_int(), ctypes.c_int()
+        w, h, bw, depth = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+        if not x.XGetGeometry(self._dpy, win, ctypes.byref(root), ctypes.byref(gx),
+                              ctypes.byref(gy), ctypes.byref(w), ctypes.byref(h),
+                              ctypes.byref(bw), ctypes.byref(depth)):
+            return None
+        rx, ry, child = ctypes.c_int(), ctypes.c_int(), ctypes.c_ulong()
+        if not x.XTranslateCoordinates(self._dpy, win, self._root, 0, 0,
+                                       ctypes.byref(rx), ctypes.byref(ry), ctypes.byref(child)):
+            return None
+        l, t, r, b = rx.value, ry.value, rx.value + w.value, ry.value + h.value
+        fe = self._prop(win, '_NET_FRAME_EXTENTS')        # left, right, top, bottom
+        if len(fe) >= 4:
+            l, r, t, b = l - fe[0], r + fe[1], t - fe[2], b + fe[3]
+        gtk = self._prop(win, '_GTK_FRAME_EXTENTS')       # invisible shadow margins
+        if len(gtk) >= 4:
+            l, r, t, b = l + gtk[0], r - gtk[1], t + gtk[2], b - gtk[3]
+        return l, t, r, b
+
+    def scan(self):
+        """Visible client windows as Platforms, topmost first. Never raises."""
+        if not self._dpy:
+            return []
+        a = self._atoms
+        prev = self._x.XSetErrorHandler(ctypes.cast(self._err_handler, ctypes.c_void_p))
+        try:
+            stack = self._prop(self._root, '_NET_CLIENT_LIST_STACKING')   # bottom → top
+            cur = self._prop(self._root, '_NET_CURRENT_DESKTOP')
+            cur = cur[0] if cur else None
+            own_pid = os.getpid()
+            wins = []
+            for win in reversed(stack):
+                if win == self._own_wid:
+                    continue
+                pid = self._prop(win, '_NET_WM_PID')
+                if pid and pid[0] == own_pid:              # Hornet herself, her menus
+                    continue
+                desk = self._prop(win, '_NET_WM_DESKTOP')
+                if cur is not None and desk and desk[0] not in (cur, 0xFFFFFFFF):
+                    continue                               # other workspace
+                state = set(self._prop(win, '_NET_WM_STATE'))
+                if a['_NET_WM_STATE_HIDDEN'] in state:     # minimized
+                    continue
+                types = self._prop(win, '_NET_WM_WINDOW_TYPE')
+                if a['_NET_WM_WINDOW_TYPE_DESKTOP'] in types:   # the desktop itself
+                    continue
+                rect = self._frame_rect(win)
+                if rect is None:
+                    continue
+                l, t, r, b = rect
+                if r - l < 4 or b - t < 4 or r <= 0 or b <= 0:   # tiny or parked off-screen
+                    continue
+                maximized = (a['_NET_WM_STATE_MAXIMIZED_VERT'] in state
+                             and a['_NET_WM_STATE_MAXIMIZED_HORZ'] in state)
+                normal = not types or types[0] in (a['_NET_WM_WINDOW_TYPE_NORMAL'],
+                                                   a['_NET_WM_WINDOW_TYPE_DIALOG'])
+                is_plat = (normal and not maximized
+                           and a['_NET_WM_STATE_FULLSCREEN'] not in state
+                           and r - l >= _PLATFORM_MIN_W)
+                wins.append((int(win), l, t, r, b, is_plat))
+        except Exception as e:
+            print(f"[platforms] X11 scan failed: {e}")
+            return []
+        finally:
+            self._x.XSync(self._dpy, 0)    # flush errors into our handler before restoring
+            self._x.XSetErrorHandler(prev)
+        return _platforms_from_stack(wins)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -859,9 +1115,7 @@ class Hornet:
     TAUNT_FPS      = 0.05   # seconds per frame for taunt animation
     TAUNT_COOLDOWN = 120.0  # seconds before Hornet can be annoyed again
     TAUNT_HOVER_TIME = 2.5  # seconds cursor must hover near Hornet to trigger taunt
-    WALK_FPS       = 0.06   # seconds per frame for the walk-in entrance
-    WALK_STOP_FPS  = 0.08   # seconds per frame for the walk-in stop animation
-    WALK_SPEED     = 240.0  # px/sec while walking on-screen at the entrance
+    RUN_IN_SKID    = 0.3    # run-in entrance: speed kept while skidding to a stop (x run speed)
 
     # Wandering: while idle on the ground she walks around and reads her map.
     # Walk speeds are derived from the stride so her feet don't slide.
@@ -1115,9 +1369,9 @@ class Hornet:
 
     def current_frame(self) -> pygame.Surface:
         if self.walk_in_phase == 'walking':
-            return self.walk_frames[self.walk_in_idx]
+            return self.run_frames[self.walk_in_idx]
         if self.walk_in_phase == 'stopping':
-            return self.walk_stop_frames[self.walk_in_idx]
+            return self.run_stop_frames[self.walk_in_idx]
         if self.sleep_phase == 'falling_asleep':
             rev = len(self.sleep_wake_frames) - 1 - self.sleep_idx
             return self.sleep_wake_frames[rev]
@@ -1878,26 +2132,33 @@ class Hornet:
         self.y  = self.floor_y
 
     def _update_walk_in(self, dt):
+        # Runs in at the run's own stride speed (no foot sliding), then skids to a stop
+        speed = self.RUN_STRIDE_PX * SPRITE_SCALE / self.RUN_FPS
+        skid  = speed * self.RUN_IN_SKID
         if self.walk_in_phase == 'walking':
-            self.x += self.WALK_SPEED * self.walk_in_dir * dt
-            reached = (self.walk_in_dir < 0 and self.x <= self.walk_in_target_x) or \
-                      (self.walk_in_dir > 0 and self.x >= self.walk_in_target_x)
+            self.x += speed * self.walk_in_dir * dt
+            # Start the stop early so the skid ends right on the target
+            stop_at = (self.walk_in_target_x
+                       - self.walk_in_dir * skid * len(self.run_stop_frames) * self.RUN_FPS)
+            reached = (self.walk_in_dir < 0 and self.x <= stop_at) or \
+                      (self.walk_in_dir > 0 and self.x >= stop_at)
             if reached:
-                self.x = self.walk_in_target_x
                 self.walk_in_phase = 'stopping'
                 self.walk_in_idx   = 0
                 self.walk_in_timer = 0.0
                 return
             self.walk_in_timer += dt
-            if self.walk_in_timer >= self.WALK_FPS:
+            if self.walk_in_timer >= self.RUN_FPS:
                 self.walk_in_timer = 0.0
-                self.walk_in_idx = (self.walk_in_idx + 1) % len(self.walk_frames)
+                self.walk_in_idx = (self.walk_in_idx + 1) % len(self.run_frames)
         elif self.walk_in_phase == 'stopping':
+            self.x += skid * self.walk_in_dir * dt
             self.walk_in_timer += dt
-            if self.walk_in_timer >= self.WALK_STOP_FPS:
+            if self.walk_in_timer >= self.RUN_FPS:
                 self.walk_in_timer = 0.0
                 self.walk_in_idx += 1
-                if self.walk_in_idx >= len(self.walk_stop_frames):
+                if self.walk_in_idx >= len(self.run_stop_frames):
+                    self.x = self.walk_in_target_x
                     self.walk_in_phase = None
                     self.walk_in_idx   = 0
                     # facing_right is preserved so the idle sprite keeps the same
@@ -3232,7 +3493,7 @@ def _show_context_menu(x, y, hornet_ref, on_quit=None):
             wander_var = tk.BooleanVar(value=tray_globals['wander'])
             pop.add_checkbutton(label='Wander', variable=wander_var,
                                 command=close_run(on_toggle_wander))
-            if PLAT == 'Windows':
+            if tray_globals['window_platforms_ok']:
                 platforms_var = tk.BooleanVar(value=tray_globals['window_platforms'])
                 pop.add_checkbutton(label='Climb Windows', variable=platforms_var,
                                     command=close_run(on_toggle_window_platforms))
@@ -3716,6 +3977,8 @@ def main():
     hwnd        = None
     click_thru  = True
     shape_mgr   = None
+    scan_platforms = _win_scan_platforms if PLAT == 'Windows' else None
+    x11_scanner = None
 
     if PLAT == 'Windows':
         hwnd = pygame.display.get_wm_info()['window']
@@ -3743,11 +4006,20 @@ def main():
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 pass
 
-            if not ARGB_MODE:
-                # Shape manager gives pixel-perfect transparency without compositor
-                shape_mgr = X11ShapeManager()
-                if not shape_mgr.connect(wid):
-                    shape_mgr = None
+            # Without a compositor the shape manager gives pixel-perfect
+            # transparency; with ARGB it still sets the input shape so the
+            # full-screen window doesn't swallow clicks meant for the desktop.
+            shape_mgr = X11ShapeManager(input_only=ARGB_MODE)
+            if not shape_mgr.connect(wid):
+                shape_mgr = None
+
+            # Under Wayland only XWayland apps are listed, so she'd stand on
+            # ledges hidden behind native windows; keep platforms off there.
+            if not os.environ.get('WAYLAND_DISPLAY'):
+                x11_scanner = X11PlatformScanner(wid)
+                if x11_scanner.available:
+                    scan_platforms = x11_scanner.scan
+            tray_globals['window_platforms_ok'] = scan_platforms is not None
 
     sprites, seqs = convert_assets(raw_sprites, raw_seqs)
 
@@ -3833,11 +4105,11 @@ def main():
         dt = min(clock.tick(60) / 1000.0, 0.05)
 
         # Window tops she can stand on (re-scanned a few times a second)
-        if PLAT == 'Windows':
+        if scan_platforms:
             platform_timer -= dt
             if platform_timer <= 0:
                 platform_timer = 0.25
-                hornet.set_platforms(_win_scan_platforms()
+                hornet.set_platforms(scan_platforms()
                                      if tray_globals['window_platforms'] else [])
 
         # On Windows, GetCursorPos works even when WS_EX_TRANSPARENT is set
@@ -3847,7 +4119,8 @@ def main():
             ctypes.windll.user32.GetCursorPos(ctypes.byref(_pt))
             mx, my = _pt.x, _pt.y
         else:
-            mx, my = pygame.mouse.get_pos()
+            pos = shape_mgr.pointer() if shape_mgr else None
+            mx, my = pos if pos else pygame.mouse.get_pos()
 
         # Windows click-through toggle
         if hwnd:
@@ -4005,6 +4278,8 @@ def main():
 
     if shape_mgr:
         shape_mgr.disconnect()
+    if x11_scanner:
+        x11_scanner.close()
     stop_needoline()
     pygame.quit()
     sys.exit(0)
