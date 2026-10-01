@@ -338,6 +338,7 @@ tray_globals = {
     'sleep_z': True,           # Show floating Z's while sleeping
     'land_mode': 'bounce',     # 'bounce' | 'soft' | 'glide' (soft + umbrella glide on high falls)
     'drag_pendulum': True,     # Swing sprite around grip while dragged
+    'wander': True,            # Walk around / read the map on her own while idle
     'cloak_color': 'default',  # Cloak hue: 'default' or '#RRGGBB'
     'spawn_mode': 'fall',      # 'fall' | 'walk_from_right' | 'walk_from_left'
 }
@@ -521,6 +522,11 @@ def load_raw_assets():
         'taunt_silk': _num_sorted(_resource('assets/sprites/taunt/taunt_silk_*.png')),
         'walk':       _num_sorted(_resource('assets/sprites/walk/walk_*.png')),
         'walk_stop':  _num_sorted(_resource('assets/sprites/walk_stop/walkstop_*.png')),
+        'turn':       _num_sorted(_resource('assets/sprites/turn/turn_*.png')),
+        'map_open':   _num_sorted(_resource('assets/sprites/map_open/map_open_*.png')),
+        'map_idle':   _num_sorted(_resource('assets/sprites/map_idle/map_idle_*.png')),
+        'map_walk':   _num_sorted(_resource('assets/sprites/map_walk/map_walk_*.png')),
+        'map_turn':   _num_sorted(_resource('assets/sprites/map_turn/map_turn_*.png')),
         'umbrella_open':  _num_sorted(_resource('assets/sprites/umbrella_open/umbrella_open_*.png')),
         'umbrella_float': _num_sorted(_resource('assets/sprites/umbrella_float/umbrella_float_*.png')),
         'umbrella_close': _num_sorted(_resource('assets/sprites/umbrella_close/umbrella_close_*.png')),
@@ -712,6 +718,20 @@ class Hornet:
     WALK_STOP_FPS  = 0.08   # seconds per frame for the walk-in stop animation
     WALK_SPEED     = 240.0  # px/sec while walking on-screen at the entrance
 
+    # Wandering: while idle on the ground she walks around and reads her map.
+    # Walk speeds are derived from the stride so her feet don't slide.
+    WANDER_IDLE_MIN    = 4.0    # seconds of standing still between activities (min)
+    WANDER_IDLE_MAX    = 12.0   # ... and max
+    WANDER_WALK_FPS    = 0.07   # seconds per frame for walk / walk start / walk stop
+    WANDER_TURN_FPS    = 0.07   # seconds per frame for the turn-around
+    WALK_STRIDE_PX     = 4.5    # px the planted foot travels per walk frame (unscaled art)
+    MAP_OPEN_FPS       = 0.08   # seconds per frame for opening / putting away the map
+    MAP_IDLE_FPS       = 0.12   # seconds per frame while standing and reading
+    MAP_WALK_FPS       = 0.08   # seconds per frame while walking and reading
+    MAP_WALK_STRIDE_PX = 3.7    # px the planted foot travels per map-walk frame (unscaled art)
+    WANDER_WALK_DIST   = (150.0, 500.0)  # px range of a walk (unscaled)
+    MAP_WALK_DIST      = (60.0, 250.0)   # px range of a walk while reading (unscaled)
+
     # Umbrella glide (land_mode == 'glide'): high falls open the umbrella and drift down.
     GLIDE_FPS          = 0.07   # seconds per frame for the float loop
     GLIDE_OPEN_FPS     = 0.05   # seconds per frame for the open (inflate) animation
@@ -768,6 +788,11 @@ class Hornet:
         self.umbrella_open_frames  = seqs['umbrella_open']
         self.umbrella_float_frames = seqs['umbrella_float']
         self.umbrella_close_frames = seqs['umbrella_close']
+        self.turn_frames        = seqs['turn']
+        self.map_open_frames    = seqs['map_open']
+        self.map_idle_frames    = seqs['map_idle']
+        self.map_walk_frames    = seqs['map_walk']
+        self.map_turn_frames    = seqs['map_turn']
         self.floor_y            = floor_y
 
         self.state        = 'IDLE'
@@ -802,6 +827,18 @@ class Hornet:
         self.glide_timer = 0.0
         self.glide_t     = 0.0   # time since the umbrella opened (drives the sway)
         self.glide_drift = 0.0   # horizontal momentum carried into the glide
+
+        # wander_phase: None|'turn'|'walk_start'|'walk'|'walk_stop'|
+        #               'map_open'|'map_idle'|'map_turn'|'map_walk'|'map_close'
+        self.wander_phase     = None
+        self.wander_idx       = 0
+        self.wander_timer     = 0.0
+        self.wander_wait      = random.uniform(self.WANDER_IDLE_MIN, self.WANDER_IDLE_MAX)
+        self.wander_dir       = 0       # -1 = walking left, +1 = walking right
+        self.wander_target_x  = 0.0
+        self.wander_then_map  = False   # open the map after this walk stops
+        self.wander_map_time  = 0.0     # seconds left reading before deciding what's next
+        self.wander_map_walks = 0       # map walks left before putting the map away
 
         # taunt state
         self.taunt_phase         = None   # None | 'taunting'
@@ -862,6 +899,10 @@ class Hornet:
         return self.glide_phase is not None
 
     @property
+    def wandering(self):
+        return self.wander_phase is not None
+
+    @property
     def _idle_w(self): return self.idle_frames[0].get_width()
     @property
     def _idle_h(self): return self.idle_frames[0].get_height()
@@ -887,6 +928,8 @@ class Hornet:
         if self.land_phase == 'wall_land':
             # sleep_wake frames 11-14 are indices 10-13
             return self.sleep_wake_frames[10 + self.land_idx]
+        if self.wander_phase is not None:
+            return self._wander_frame()
         if self.glide_phase == 'open':
             return self.umbrella_open_frames[self.glide_idx]
         if self.glide_phase == 'float':
@@ -990,6 +1033,7 @@ class Hornet:
                 self.taunt_idx   = 0
                 self.taunt_timer = 0.0
                 self.glide_phase = None
+                self._cancel_wander()
                 self.sit_phase = 'sit_down'
                 self.sit_idx   = 0
                 self.sit_timer = 0.0
@@ -1007,6 +1051,7 @@ class Hornet:
     def _start_drag(self, mx, my):
         self.land_phase  = None
         self.glide_phase = None
+        self._cancel_wander()
         # Grabbing during the walk-in entrance cancels it so the user is in control.
         self.walk_in_phase = None
         self.walk_in_idx   = 0
@@ -1178,7 +1223,8 @@ class Hornet:
 
     # ── state ─────────────────────────────────────────────────────────────────
     def _upd_state(self):
-        if self.sitting or self.dragging or self.land_phase is not None or self.gliding:
+        if (self.sitting or self.dragging or self.land_phase is not None
+                or self.gliding or self.wandering):
             self.state = 'IDLE'; return
         spd = math.hypot(self.vx, self.vy)
         if spd < 80 or self.vy <= 0:
@@ -1407,9 +1453,10 @@ class Hornet:
             w    = 2.0 * math.pi / self.GLIDE_SWAY_PERIOD
             ramp = min(1.0, self.glide_t / 0.8)
             self.vx = self.glide_drift + self.GLIDE_SWAY_AMP * w * math.cos(w * self.glide_t) * ramp
-        # Face the carried momentum only; the sway alone must not flip her back and forth
+        # Face the carried momentum only; the sway alone must not flip her back and forth.
+        # Source art faces left, so unflipped (facing_right=True) means moving left.
         if abs(self.glide_drift) > 30:
-            self.facing_right = self.glide_drift > 0
+            self.facing_right = self.glide_drift < 0
         self.x += self.vx * dt
         self.y += self.vy * dt
 
@@ -1521,6 +1568,7 @@ class Hornet:
 
     # ── taunt state machine ───────────────────────────────────────────────────
     def _start_taunt(self):
+        self._cancel_wander()
         self.taunt_phase         = 'taunting'
         self.taunt_idx           = 0
         self.taunt_timer         = 0.0
@@ -1599,6 +1647,174 @@ class Hornet:
                     # facing_right is preserved so the idle sprite keeps the same
                     # inward-facing orientation Hornet had while stopping.
 
+    # ── wandering ─────────────────────────────────────────────────────────────
+    def _wander_frame(self) -> pygame.Surface:
+        p, i = self.wander_phase, self.wander_idx
+        if p == 'turn':       return self.turn_frames[i]
+        if p == 'walk_start': return self.walk_stop_frames[-1 - i]   # stop, played backwards
+        if p == 'walk':       return self.walk_frames[i]
+        if p == 'walk_stop':  return self.walk_stop_frames[i]
+        if p == 'map_open':   return self.map_open_frames[i]
+        if p == 'map_idle':   return self.map_idle_frames[i]
+        if p == 'map_turn':   return self.map_turn_frames[i]
+        if p == 'map_walk':   return self.map_walk_frames[i]
+        return self.map_open_frames[-1 - i]                           # map_close
+
+    def _wander_seq_info(self, p):
+        """(frame count, seconds per frame, loops?) for a wander phase."""
+        return {
+            'turn':       (len(self.turn_frames),      self.WANDER_TURN_FPS, False),
+            'walk_start': (len(self.walk_stop_frames), self.WANDER_WALK_FPS, False),
+            'walk':       (len(self.walk_frames),      self.WANDER_WALK_FPS, True),
+            'walk_stop':  (len(self.walk_stop_frames), self.WANDER_WALK_FPS, False),
+            'map_open':   (len(self.map_open_frames),  self.MAP_OPEN_FPS,    False),
+            'map_idle':   (len(self.map_idle_frames),  self.MAP_IDLE_FPS,    True),
+            'map_turn':   (len(self.map_turn_frames),  self.MAP_OPEN_FPS,    False),
+            'map_walk':   (len(self.map_walk_frames),  self.MAP_WALK_FPS,    True),
+            'map_close':  (len(self.map_open_frames),  self.MAP_OPEN_FPS,    False),
+        }[p]
+
+    def _set_wander_phase(self, p):
+        self.wander_phase = p
+        self.wander_idx   = 0
+        self.wander_timer = 0.0
+
+    def _cancel_wander(self):
+        self.wander_phase = None
+        self.wander_idx   = 0
+        self.wander_timer = 0.0
+        self.wander_wait  = max(self.wander_wait, self.WANDER_IDLE_MIN)
+
+    def _end_wander(self):
+        self.wander_phase = None
+        self.wander_idx   = 0
+        self.wander_timer = 0.0
+        self.idle_idx     = 0
+        self.idle_timer   = 0.0
+        self.wander_wait  = random.uniform(self.WANDER_IDLE_MIN, self.WANDER_IDLE_MAX)
+
+    def _wander_bounds(self):
+        """Allowed x range (top-left) for wandering: the work area of the monitor
+        she's standing on, so she never walks onto a monitor with another floor."""
+        lo = self.world_left
+        hi = self.world_left + self.world_w - self._idle_w
+        cx = self.x + self._idle_w / 2
+        for (ml, mt, mr, mb, wl, wt, wr, wb) in self.monitors:
+            if ml <= cx <= mr:
+                lo, hi = max(lo, wl), min(hi, wr - self._idle_w)
+                break
+        margin = self._idle_w * 0.3
+        return lo + margin, hi - margin
+
+    def _pick_wander_target(self, dist_range):
+        """Random (dir, target_x) with enough room, or None if she's boxed in."""
+        dmin, dmax = (d * SPRITE_SCALE for d in dist_range)
+        lo, hi = self._wander_bounds()
+        dirs = [-1, 1]
+        random.shuffle(dirs)
+        for d in dirs:
+            room = (self.x - lo) if d < 0 else (hi - self.x)
+            if room >= dmin:
+                return d, self.x + d * random.uniform(dmin, min(dmax, room))
+        return None
+
+    def _choose_wander(self):
+        r = random.random()
+        if r < 0.5:
+            pick = self._pick_wander_target(self.WANDER_WALK_DIST)
+            if pick:
+                self.wander_dir, self.wander_target_x = pick
+                self.wander_then_map = random.random() < 0.3
+                want_facing = self.wander_dir < 0   # source art faces left
+                if want_facing != self.facing_right:
+                    self.facing_right = want_facing
+                    self._set_wander_phase('turn')
+                else:
+                    self._set_wander_phase('walk_start')
+                return
+        if r < 0.8:   # also the fallback when there's no room to walk
+            self._start_map()
+            return
+        # Otherwise just keep standing a while longer
+        self.wander_wait = random.uniform(self.WANDER_IDLE_MIN, self.WANDER_IDLE_MAX)
+
+    def _start_map(self):
+        self.wander_map_walks = random.choice((0, 1, 1, 2))
+        self._set_wander_phase('map_open')
+
+    def _wander_walk_step(self, dt, stride_px, fps):
+        """Move toward the target; returns True once it's reached."""
+        speed = stride_px * SPRITE_SCALE / fps
+        self.x += self.wander_dir * speed * dt
+        lo, hi = self._wander_bounds()
+        reached = ((self.wander_dir < 0 and self.x <= self.wander_target_x) or
+                   (self.wander_dir > 0 and self.x >= self.wander_target_x) or
+                   self.x <= lo or self.x >= hi)
+        if reached:
+            self.x = min(max(self.x, lo), hi)
+        return reached
+
+    def _update_wander(self, dt):
+        self.vx = self.vy = 0.0
+        self.y  = self.floor_y
+        p = self.wander_phase
+
+        if p == 'walk':
+            if self._wander_walk_step(dt, self.WALK_STRIDE_PX, self.WANDER_WALK_FPS):
+                self._set_wander_phase('walk_stop')
+                return
+        elif p == 'map_walk':
+            if self._wander_walk_step(dt, self.MAP_WALK_STRIDE_PX, self.MAP_WALK_FPS):
+                self._set_wander_phase('map_idle')
+                self.wander_map_time = random.uniform(2.0, 5.0)
+                return
+        elif p == 'map_idle':
+            self.wander_map_time -= dt
+            if self.wander_map_time <= 0:
+                pick = (self._pick_wander_target(self.MAP_WALK_DIST)
+                        if self.wander_map_walks > 0 and tray_globals.get('wander', True) else None)
+                if pick:
+                    self.wander_map_walks -= 1
+                    self.wander_dir, self.wander_target_x = pick
+                    want_facing = self.wander_dir < 0
+                    if want_facing != self.facing_right:
+                        self.facing_right = want_facing
+                        self._set_wander_phase('map_turn')
+                    else:
+                        self._set_wander_phase('map_walk')
+                else:
+                    self._set_wander_phase('map_close')
+                return
+
+        # Animation
+        count, fps, loops = self._wander_seq_info(p)
+        self.wander_timer += dt
+        if self.wander_timer < fps:
+            return
+        self.wander_timer = 0.0
+        self.wander_idx += 1
+        if self.wander_idx < count:
+            return
+        if loops:
+            self.wander_idx = 0
+            return
+        # One-shot finished: move on
+        if p in ('turn', 'walk_start'):
+            # TurnWalk already ends mid-stride, so it flows straight into the walk
+            self._set_wander_phase('walk')
+        elif p == 'walk_stop':
+            if self.wander_then_map and tray_globals.get('wander', True):
+                self._start_map()
+            else:
+                self._end_wander()
+        elif p == 'map_open':
+            self._set_wander_phase('map_idle')
+            self.wander_map_time = random.uniform(3.0, 8.0)
+        elif p == 'map_turn':
+            self._set_wander_phase('map_walk')
+        else:  # map_close
+            self._end_wander()
+
     # ── physics ───────────────────────────────────────────────────────────────
     def update(self, dt, mx=None, my=None):
         world_right = self.world_left + self.world_w
@@ -1610,6 +1826,11 @@ class Hornet:
         # Refresh floor for whichever monitor sits under her right now
         if self.monitors:
             self.floor_y = self._floor_for_x(self.x + self._idle_w / 2)
+
+        # Give her a breather after any interaction before she wanders off
+        if (self.walk_in_phase or self.sleep_phase or self.taunt_phase or self.sit_phase
+                or self.land_phase or self.glide_phase or self.dragging or self._pending):
+            self.wander_wait = max(self.wander_wait, self.WANDER_IDLE_MIN)
 
         # Walk-in entrance overrides all other state until it completes.
         if self.walk_in_phase is not None:
@@ -1666,14 +1887,27 @@ class Hornet:
         else:
             self.taunt_hover_timer = 0.0
 
+        if self.wander_phase is not None:
+            self._update_wander(dt)
+            return
+
         # Inactivity sleep: only count when resting on the ground
         if self.is_on_ground():
             self.inactivity_timer += dt
             if self.inactivity_timer >= self.SLEEP_TIMEOUT:
                 self._start_sleep()
                 return
+            # Wander brain: after standing still a while, pick something to do
+            if (tray_globals.get('wander', True) and not self._pending
+                    and abs(self.vx) < 5 and self.vy == 0.0):
+                self.wander_wait -= dt
+                if self.wander_wait <= 0:
+                    self._choose_wander()
+                    if self.wander_phase is not None:
+                        return
         else:
             self.inactivity_timer = 0.0
+            self.wander_wait = max(self.wander_wait, self.WANDER_IDLE_MIN)
         if abs(self.vx) > 30:
             self.facing_right = self.vx > 0
         self.vy += self.GRAVITY * dt
@@ -1742,7 +1976,8 @@ class Hornet:
         return -int(self._idle_h * IDLE_Y_OFFSET)
 
     def _sit_x_offset(self, frame: pygame.Surface) -> int:
-        return (self._idle_w - frame.get_width()) // 2 if (self.sitting or self.gliding) else 0
+        centred = self.sitting or self.gliding or self.wandering or self.walking_in
+        return (self._idle_w - frame.get_width()) // 2 if centred else 0
 
     def _glide_y_offset(self, frame: pygame.Surface) -> int:
         # Umbrella frames are top-aligned to the idle head; the needle hangs below
@@ -1801,6 +2036,8 @@ class Hornet:
             return ('sleep', self.sleep_phase, self.sleep_idx, self.facing_right)
         if self.land_phase:
             return ('land', self.land_phase, self.land_idx, self.facing_right)
+        if self.wander_phase:
+            return ('wander', self.wander_phase, self.wander_idx, self.facing_right)
         if self.glide_phase:
             return ('glide', self.glide_phase, self.glide_idx, self.facing_right)
         if self.taunt_phase:
@@ -1855,6 +2092,10 @@ _CONFIG_DEFAULTS = {
     'glide_min_height': 250.0,
     'glide_sway_amp':   30.0,
     'glide_fps':        0.07,
+    'wander':           True,
+    'wander_idle_min':  4.0,
+    'wander_idle_max':  12.0,
+    'wander_walk_fps':  0.07,
 }
 
 _SPAWN_MODES = ('fall', 'walk_from_right', 'walk_from_left')
@@ -1962,6 +2203,9 @@ def load_config(apply_volume=False):
     Hornet.GLIDE_MIN_HEIGHT = float(cfg['glide_min_height'])
     Hornet.GLIDE_SWAY_AMP   = float(cfg['glide_sway_amp'])
     Hornet.GLIDE_FPS        = float(cfg['glide_fps'])
+    Hornet.WANDER_IDLE_MIN  = float(cfg['wander_idle_min'])
+    Hornet.WANDER_IDLE_MAX  = max(Hornet.WANDER_IDLE_MIN, float(cfg['wander_idle_max']))
+    Hornet.WANDER_WALK_FPS  = float(cfg['wander_walk_fps'])
     new_scale = max(0.1, float(cfg['scale']) / 100.0)
     new_cloak = str(cfg['cloak_color'])
     if apply_volume and (abs(new_scale - SPRITE_SCALE) > 1e-6 or new_cloak != CLOAK_COLOR):
@@ -1979,6 +2223,7 @@ def load_config(apply_volume=False):
     lm = str(cfg['land_mode'])
     tray_globals['land_mode']   = lm if lm in _LAND_MODES else 'bounce'
     tray_globals['drag_pendulum'] = bool(cfg['drag_pendulum'])
+    tray_globals['wander']      = bool(cfg['wander'])
     tray_globals['cloak_color'] = CLOAK_COLOR
     sm = str(cfg['spawn_mode'])
     if sm not in _SPAWN_MODES:
@@ -2074,6 +2319,10 @@ def _show_context_menu(x, y, hornet_ref, on_quit=None):
                 tray_globals['drag_pendulum'] = not tray_globals['drag_pendulum']
                 _save_config_key('drag_pendulum', tray_globals['drag_pendulum'])
 
+            def on_toggle_wander():
+                tray_globals['wander'] = not tray_globals['wander']
+                _save_config_key('wander', tray_globals['wander'])
+
             def on_reload_config():
                 load_config(apply_volume=True)
 
@@ -2148,6 +2397,9 @@ def _show_context_menu(x, y, hornet_ref, on_quit=None):
             drag_pendulum_var = tk.BooleanVar(value=tray_globals['drag_pendulum'])
             pop.add_checkbutton(label='Drag Pendulum', variable=drag_pendulum_var,
                                 command=close_run(on_toggle_drag_pendulum))
+            wander_var = tk.BooleanVar(value=tray_globals['wander'])
+            pop.add_checkbutton(label='Wander', variable=wander_var,
+                                command=close_run(on_toggle_wander))
             pop.add_separator()
             pop.add_command(label='Reload Config', command=close_run(on_reload_config))
             if PLAT == 'Windows':
@@ -2229,6 +2481,10 @@ def _create_tray_icon(hwnd, hornet_ref):
         tray_globals['drag_pendulum'] = not tray_globals['drag_pendulum']
         _save_config_key('drag_pendulum', tray_globals['drag_pendulum'])
 
+    def on_toggle_wander(icon=None, item=None):
+        tray_globals['wander'] = not tray_globals['wander']
+        _save_config_key('wander', tray_globals['wander'])
+
     def on_cloak_preset(color_val):
         def handler(icon=None, item=None):
             _set_cloak_color(color_val)
@@ -2298,6 +2554,8 @@ def _create_tray_icon(hwnd, hornet_ref):
                      checked=lambda item: tray_globals['sleep_z']),
             MenuItem('Drag Pendulum', on_toggle_drag_pendulum,
                      checked=lambda item: tray_globals['drag_pendulum']),
+            MenuItem('Wander', on_toggle_wander,
+                     checked=lambda item: tray_globals['wander']),
             MenuItem('Reload Config', on_reload_config),
             MenuItem('Reset Topmost', on_reset_topmost),
             MenuItem('Quit', on_quit),
@@ -2810,6 +3068,11 @@ def main():
             hornet.umbrella_open_frames  = new_seqs['umbrella_open']
             hornet.umbrella_float_frames = new_seqs['umbrella_float']
             hornet.umbrella_close_frames = new_seqs['umbrella_close']
+            hornet.turn_frames       = new_seqs['turn']
+            hornet.map_open_frames   = new_seqs['map_open']
+            hornet.map_idle_frames   = new_seqs['map_idle']
+            hornet.map_walk_frames   = new_seqs['map_walk']
+            hornet.map_turn_frames   = new_seqs['map_turn']
             old_floor_y    = hornet.floor_y
             hornet.floor_y = hornet._floor_for_x(hornet.x + hornet._idle_w / 2)
             hornet.y      += hornet.floor_y - old_floor_y

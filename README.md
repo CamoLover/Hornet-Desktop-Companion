@@ -35,6 +35,7 @@
 - **Throwable** -  drag and release with momentum to fling her
 - **Cloak recoloring** -  choose from color presets or a custom hex color for Hornet's cloak, from the tray icon
 - **Spawn animation** -  choose whether Hornet falls in from the top or walks in from the left/right edge of the screen on launch
+- **Wandering** -  when left alone she walks around on her own, turns, stops, pulls out her map to read it, and sometimes strolls while reading (toggle from the menu)
 
 ---
 
@@ -222,6 +223,10 @@ All values hot-reload instantly via **Tray → Reload Config**.
 | `taunt_hover_time` | `2.5` | Seconds the cursor must hover near Hornet to trigger a taunt |
 | `cloak_color` | `"default"` | Cloak hue -  `"default"` or a `"#RRGGBB"` hex string |
 | `spawn_mode` | `"fall"` | How Hornet enters on launch -  `"fall"`, `"walk_from_right"`, or `"walk_from_left"` |
+| `wander` | `true` | Let Hornet walk around and read her map on her own while idle |
+| `wander_idle_min` | `4.0` | Minimum seconds she stands still between activities |
+| `wander_idle_max` | `12.0` | Maximum seconds she stands still between activities |
+| `wander_walk_fps` | `0.07` | Seconds per walk frame; walk speed follows it so her feet never slide |
 
 ---
 
@@ -248,8 +253,13 @@ All values hot-reload instantly via **Tray → Reload Config**.
 | `assets/sprites/umbrella_close/` | Umbrella glide closing (2 frames) |
 | `assets/sprites/taunt/` | Taunt animation (19 frames + 8-frame silk effect) |
 | `assets/sprites/sleep_wake/` | Sleep / wake transition (14 frames, played forward and reversed) |
-| `assets/sprites/walk/` | Walk-in entrance animation (10 frames) |
-| `assets/sprites/walk_stop/` | Walk-in stop transition (5 frames) |
+| `assets/sprites/walk/` | Walk cycle, used by the walk-in and wandering (10 frames) |
+| `assets/sprites/walk_stop/` | Walk-to-idle transition, played backwards to start walking (5 frames) |
+| `assets/sprites/turn/` | Turn-around while walking (3 frames) |
+| `assets/sprites/map_open/` | Pull out the map, played backwards to put it away (2 frames) |
+| `assets/sprites/map_idle/` | Standing and reading the map (6 frames) |
+| `assets/sprites/map_walk/` | Walking while reading the map (10 frames) |
+| `assets/sprites/map_turn/` | Turn-around while holding the map (2 frames) |
 | `assets/audio/needoline.mp3` | Background music track |
 | `assets/logo/` | App icon (PNG + ICO) |
 
