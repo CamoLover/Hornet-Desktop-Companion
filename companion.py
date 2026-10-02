@@ -396,6 +396,7 @@ tray_globals = {
     'land_mode': 'bounce',     # 'bounce' | 'soft' | 'glide' (soft + umbrella glide on high falls)
     'drag_pendulum': True,     # Swing sprite around grip while dragged
     'wander': True,            # Walk around / read the map on her own while idle
+    'cursor_look': True,       # Head follows the cursor, flinches, leans in
     'window_platforms': True,  # Stand on / climb desktop windows (Windows, Linux X11)
     'window_platforms_ok': PLAT == 'Windows',  # Linux: set once the X11 scanner connects
     'cloak_color': 'default',  # Cloak hue: 'default' or '#RRGGBB'
@@ -931,6 +932,15 @@ def load_raw_assets():
         'umbrella_open':  _num_sorted(_resource('assets/sprites/umbrella_open/umbrella_open_*.png')),
         'umbrella_float': _num_sorted(_resource('assets/sprites/umbrella_float/umbrella_float_*.png')),
         'umbrella_close': _num_sorted(_resource('assets/sprites/umbrella_close/umbrella_close_*.png')),
+        'look_up':       _num_sorted(_resource('assets/sprites/look_up/look_up_[0-9]*.png')),
+        'look_up_end':   _num_sorted(_resource('assets/sprites/look_up_end/look_up_end_*.png')),
+        'look_up_half':  _num_sorted(_resource('assets/sprites/look_up_half/look_up_half_*.png')),
+        'look_down':     _num_sorted(_resource('assets/sprites/look_down/look_down_[0-9]*.png')),
+        'look_down_end': _num_sorted(_resource('assets/sprites/look_down_end/look_down_end_*.png')),
+        'look_slight':   _num_sorted(_resource('assets/sprites/look_slight/look_slight_*.png')),
+        'head_back':     _num_sorted(_resource('assets/sprites/head_back/head_back_*.png')),
+        'idle_back':     _num_sorted(_resource('assets/sprites/idle_back/idle_back_*.png')),
+        'flinch':        _num_sorted(_resource('assets/sprites/flinch/flinch_*.png')),
     }
     singles = {
         'FAST_FALL':       _resource('assets/sprites/fast_fall/hornet_fast_fall.png'),
@@ -1146,13 +1156,33 @@ class Hornet:
     SIT_REST_FPS    = 0.1     # seconds per frame for the quiet sit (no music)
     EXTRA_SEQS = ('run', 'run_start', 'run_stop', 'jump', 'hop', 'hop_land', 'somersault',
                   'fall', 'weak_fall', 'bonk_land', 'wall_mantle', 'mantle_land', 'walljump',
-                  'climb', 'climb_cling', 'walljump_antic', 'sit_rest')
+                  'climb', 'climb_cling', 'walljump_antic', 'sit_rest',
+                  'look_up', 'look_up_end', 'look_up_half', 'look_down', 'look_down_end',
+                  'look_slight', 'head_back', 'idle_back', 'flinch')
     GROUND_PHASES = frozenset(('turn', 'walk_start', 'walk', 'walk_stop', 'run_start', 'run',
                                'run_stop', 'map_open', 'map_idle', 'map_turn', 'map_walk',
                                'map_close'))
     WALL_PHASES   = frozenset(('climb_crouch', 'climb_leap', 'climb_settle', 'cling',
                                'walljump_antic'))
     CENTRED_LANDS = frozenset(('hop_land', 'bonk_land'))
+
+    # Cursor awareness (cursor_look): while standing idle her head follows the cursor,
+    # she flinches when it whips past and leans in when it rests on her.
+    LOOK_FPS        = 0.07    # seconds per frame for turning the head to / away from a pose
+    LOOK_LOOP_FPS   = 0.12    # seconds per frame while holding a pose
+    FLINCH_FPS      = 0.1     # seconds per frame for the flinch
+    LOOK_RADIUS     = 5.0     # reacts to the cursor within this distance (x her height)
+    LOOK_SETTLE     = 0.2     # seconds the cursor must stay in a zone before she reacts
+    LOOK_MIN_HOLD   = 0.6     # seconds a pose is held at least before switching
+    LOOK_UP_DEG     = 60.0    # cursor angle above her head for the full look up
+    LOOK_HALF_DEG   = 22.0    # ... for the half look up
+    LOOK_DOWN_DEG   = -20.0   # cursor angle below her head for the slight look down
+    LOOK_BEHIND     = 0.3     # cursor this far behind her face (x her width) = look back
+    LEAN_DELAY      = 0.6     # seconds the cursor must rest on her before she leans in
+    LEAN_STILL_SPD  = 60.0    # px/sec: slower than this counts as resting
+    FLINCH_SPEED    = 2500.0  # px/sec of cursor speed that startles her
+    FLINCH_RANGE    = 1.2     # ... when it passes within this distance (x her height)
+    FLINCH_COOLDOWN = 5.0     # seconds between flinches
 
     # Umbrella glide (land_mode == 'glide'): high falls open the umbrella and drift down.
     GLIDE_FPS          = 0.07   # seconds per frame for the float loop
@@ -1303,6 +1333,20 @@ class Hornet:
         self.taunt_cooldown_timer = 0.0   # counts down; taunt allowed when <= 0
         self.taunt_hover_timer   = 0.0    # how long cursor has been near Hornet
 
+        # Cursor awareness. look_pose: None|'up'|'up_half'|'slight'|'down'|'back'|'flinch'
+        #                   look_phase: 'enter'|'loop'|'exit'
+        self.look_pose     = None
+        self.look_phase    = 'enter'
+        self.look_idx      = 0
+        self.look_timer    = 0.0
+        self.look_hold     = 0.0    # seconds spent in the current pose
+        self.look_want     = None   # pose the cursor currently asks for
+        self.look_want_t   = 0.0    # ... and for how long it has
+        self.lean_t        = 0.0    # seconds the cursor has rested on her
+        self.flinch_cd     = 0.0
+        self.cursor_prev   = None   # last (mx, my), for cursor speed
+        self.cursor_speed  = 0.0    # px/sec, smoothed
+
         # walk-in entrance state: None | 'walking' | 'stopping'
         self.walk_in_phase    = None
         self.walk_in_idx      = 0
@@ -1357,6 +1401,15 @@ class Hornet:
     @property
     def wandering(self):
         return self.wander_phase is not None
+
+    @property
+    def looking(self):
+        """A cursor-look pose is what's on screen (only ever over the plain idle)."""
+        return (self.look_pose is not None and self.state == 'IDLE' and not self.dragging
+                and self.walk_in_phase is None and self.sleep_phase is None
+                and self.land_phase is None and self.wander_phase is None
+                and self.air_anim is None and self.glide_phase is None
+                and self.taunt_phase is None and self.sit_phase is None)
 
     def bind_extra_frames(self, seqs):
         for k in self.EXTRA_SEQS:
@@ -1420,6 +1473,9 @@ class Hornet:
             return self.sit_outro_frames[-1]
         if self.sit_phase == 'sit_up':
             return self.sit_up_frames[self.sit_idx]
+        if self.looking:
+            frames = self._look_frames()
+            return frames[min(self.look_idx, len(frames) - 1)]
         if self.state == 'IDLE':
             return self.idle_frames[self.idle_idx]
         return self.sprites[self.state]
@@ -2111,6 +2167,143 @@ class Hornet:
         surface.blit(silk_raw, (sx, sy))
 
     # ── walk-in entrance state machine ────────────────────────────────────────
+    # ── cursor awareness ──
+    def _look_frames(self):
+        """Frames for the current look pose and phase."""
+        p = self.look_pose
+        if p == 'flinch':
+            return self.flinch_frames
+        if p == 'up':
+            seq = (self.look_up_frames[:2], self.look_up_frames[2:], self.look_up_end_frames)
+        elif p == 'down':
+            seq = (self.look_down_frames[:2], self.look_down_frames[2:], self.look_down_end_frames)
+        elif p == 'back':
+            seq = (self.head_back_frames, self.idle_back_frames, self.head_back_frames[::-1])
+        else:
+            # The first frame is the in-between pose, both into and out of the loop
+            f = self.look_up_half_frames if p == 'up_half' else self.look_slight_frames
+            seq = (f[:1], f[1:], f[:1])
+        return seq[('enter', 'loop', 'exit').index(self.look_phase)]
+
+    def _set_look(self, pose, phase='enter'):
+        if pose != self.look_pose:
+            self.look_hold = 0.0
+        self.look_pose  = pose
+        self.look_phase = phase
+        self.look_idx   = 0
+        self.look_timer = 0.0
+
+    def _reset_look(self):
+        self.look_pose   = None
+        self.look_idx    = 0
+        self.look_timer  = 0.0
+        self.look_want   = None
+        self.look_want_t = 0.0
+        self.lean_t      = 0.0
+
+    def _track_cursor(self, dt, mx, my):
+        """Smoothed cursor speed, measured every frame so it never spikes on resume."""
+        if mx is None or my is None or dt <= 0:
+            self.cursor_prev  = None
+            self.cursor_speed = 0.0
+            return
+        if self.cursor_prev is not None:
+            inst = math.hypot(mx - self.cursor_prev[0], my - self.cursor_prev[1]) / dt
+            self.cursor_speed += (inst - self.cursor_speed) * min(1.0, dt * 20.0)
+        self.cursor_prev = (mx, my)
+
+    def _look_allowed(self, mx, my):
+        return (tray_globals.get('cursor_look', True) and mx is not None and my is not None
+                and self.state == 'IDLE' and not self.dragging
+                and self.walk_in_phase is None and self.sleep_phase is None
+                and self.taunt_phase is None and self.sit_phase is None
+                and self.land_phase is None and self.glide_phase is None
+                and self.wander_phase is None and self.air_anim is None
+                and not self.plan_running and self.is_on_ground() and abs(self.vx) < 5)
+
+    def _look_target(self, mx, my):
+        """Pose the cursor position asks for, or None to just stand there."""
+        w, h = self._idle_w, self._idle_h
+        fx = self.IDLE_FACE_X * SPRITE_SCALE
+        head_x = self.x + (fx if self.facing_right else w - fx)
+        head_y = self.y + h * 0.45
+        face = -1.0 if self.facing_right else 1.0   # source art faces left
+        dx = (mx - head_x) * face                   # > 0: in front of her
+        dy = head_y - my                            # > 0: above her head
+        if math.hypot(dx, dy) > h * self.LOOK_RADIUS:
+            return None
+        on_body = self.is_clicked(mx, my)
+        if self.lean_t >= self.LEAN_DELAY or (self.look_pose == 'down' and on_body):
+            return 'down'
+        if on_body:
+            return self.look_want   # no clear direction while it's on her: keep the last
+        if dx < -w * self.LOOK_BEHIND:
+            return 'back'
+        ang = math.degrees(math.atan2(dy, abs(dx)))
+        if ang >= self.LOOK_UP_DEG:
+            return 'up'
+        if ang >= self.LOOK_HALF_DEG:
+            return 'up_half'
+        if ang <= self.LOOK_DOWN_DEG:
+            return 'slight'
+        return None
+
+    def _update_look(self, dt, mx, my):
+        self.flinch_cd = max(0.0, self.flinch_cd - dt)
+        h  = self._idle_h
+        cx = self.x + self._idle_w / 2
+        cy = self.y + h / 2
+        if self.is_clicked(mx, my) and self.cursor_speed < self.LEAN_STILL_SPD:
+            self.lean_t += dt
+        else:
+            self.lean_t = 0.0
+
+        # Startled by the cursor whipping past close by
+        if (self.cursor_speed >= self.FLINCH_SPEED and self.flinch_cd <= 0
+                and self.look_pose != 'flinch'
+                and math.hypot(mx - cx, my - cy) <= h * self.FLINCH_RANGE):
+            self._set_look('flinch')
+            self.flinch_cd = self.FLINCH_COOLDOWN
+            return
+
+        if self.look_pose is not None:
+            self.look_hold  += dt
+            self.look_timer += dt
+            fps = (self.FLINCH_FPS if self.look_pose == 'flinch'
+                   else self.LOOK_LOOP_FPS if self.look_phase == 'loop' else self.LOOK_FPS)
+            if self.look_timer >= fps:
+                self.look_timer = 0.0
+                self.look_idx  += 1
+                if self.look_idx >= len(self._look_frames()):
+                    if self.look_pose == 'flinch':
+                        # The flinch recovers into a wary half look up
+                        self._set_look('up_half', 'loop')
+                    elif self.look_phase == 'enter':
+                        self.look_phase, self.look_idx = 'loop', 0
+                    elif self.look_phase == 'loop':
+                        self.look_idx = 0
+                    else:
+                        self.look_pose, self.look_idx = None, 0
+                        self.idle_idx, self.idle_timer = 0, 0.0
+        if self.look_pose == 'flinch':
+            return
+
+        # Debounced so she doesn't twitch when the cursor sits on a zone border
+        want = self._look_target(mx, my)
+        if want != self.look_want:
+            self.look_want, self.look_want_t = want, 0.0
+        else:
+            self.look_want_t += dt
+        if self.look_want_t < self.LOOK_SETTLE:
+            return
+        if self.look_pose is None:
+            if want is not None:
+                self._set_look(want)
+        elif (self.look_phase != 'exit' and want != self.look_pose
+                and self.look_hold >= self.LOOK_MIN_HOLD):
+            # Back to neutral first; the next pose (if any) starts from there
+            self.look_phase, self.look_idx, self.look_timer = 'exit', 0, 0.0
+
     def _start_walk_in(self, from_side, target_x):
         """Begin the walk-in entrance from off-screen.
         from_side: 'right' (walk leftward) | 'left' (walk rightward).
@@ -2877,6 +3070,9 @@ class Hornet:
         # Tick cooldown regardless of state
         if self.taunt_cooldown_timer > 0:
             self.taunt_cooldown_timer -= dt
+        self._track_cursor(dt, mx, my)
+        if self.look_pose is not None and not self.looking:
+            self._reset_look()   # something else took over: start fresh afterwards
 
         # Refresh the floor under her: monitor floor or a window top below her feet
         if self.monitors:
@@ -2943,6 +3139,16 @@ class Hornet:
                 self.taunt_hover_timer = 0.0
         else:
             self.taunt_hover_timer = 0.0
+
+        # Cursor awareness: head follows the cursor while she stands around
+        if self._look_allowed(mx, my):
+            self._update_look(dt, mx, my)
+            if self.lean_t > 0 or self.look_pose in ('down', 'flinch'):
+                # You're paying attention to her: don't wander off or doze
+                self.wander_wait = max(self.wander_wait, self.WANDER_IDLE_MIN)
+                self.inactivity_timer = 0.0
+        elif self.look_pose is not None:
+            self._reset_look()
 
         if self.wander_phase is not None:
             self._update_wander(dt)
@@ -3060,7 +3266,11 @@ class Hornet:
             # Wall frames are cropped at the hands/feet: put that edge on the wall
             wx = self.climb_wall_x if self.climb_side == 'left' else self.climb_wall_x - frame.get_width()
             return int(wx) - int(self.x)
-        centred = (self.sitting or self.gliding or self.wandering or self.walking_in
+        if self.looking and not self.facing_right:
+            # Look frames are cropped at the needle tip on the left: once flipped,
+            # keep that edge (and so her feet) where the idle frame's is
+            return self._idle_w - frame.get_width()
+        centred =(self.sitting or self.gliding or self.wandering or self.walking_in
                    or self.air_anim is not None or self.land_phase in self.CENTRED_LANDS)
         return (self._idle_w - frame.get_width()) // 2 if centred else 0
 
@@ -3131,6 +3341,8 @@ class Hornet:
             return ('taunt', self.taunt_idx, self.facing_right)
         if self.sit_phase:
             return ('sit', self.sit_phase, self.sit_idx, self.facing_right)
+        if self.looking:
+            return ('look', self.look_pose, self.look_phase, self.look_idx, self.facing_right)
         if self.state == 'IDLE':
             return ('idle', self.idle_idx, self.facing_right)
         return (self.state, self.facing_right)
@@ -3180,6 +3392,7 @@ _CONFIG_DEFAULTS = {
     'glide_sway_amp':   30.0,
     'glide_fps':        0.07,
     'wander':           True,
+    'cursor_look':      True,
     'wander_idle_min':  4.0,
     'wander_idle_max':  12.0,
     'wander_walk_fps':  0.07,
@@ -3312,6 +3525,7 @@ def load_config(apply_volume=False):
     tray_globals['land_mode']   = lm if lm in _LAND_MODES else 'bounce'
     tray_globals['drag_pendulum'] = bool(cfg['drag_pendulum'])
     tray_globals['wander']      = bool(cfg['wander'])
+    tray_globals['cursor_look'] = bool(cfg['cursor_look'])
     tray_globals['window_platforms'] = bool(cfg['window_platforms'])
     tray_globals['cloak_color'] = CLOAK_COLOR
     sm = str(cfg['spawn_mode'])
@@ -3412,6 +3626,10 @@ def _show_context_menu(x, y, hornet_ref, on_quit=None):
                 tray_globals['wander'] = not tray_globals['wander']
                 _save_config_key('wander', tray_globals['wander'])
 
+            def on_toggle_cursor_look():
+                tray_globals['cursor_look'] = not tray_globals['cursor_look']
+                _save_config_key('cursor_look', tray_globals['cursor_look'])
+
             def on_toggle_window_platforms():
                 tray_globals['window_platforms'] = not tray_globals['window_platforms']
                 _save_config_key('window_platforms', tray_globals['window_platforms'])
@@ -3493,6 +3711,9 @@ def _show_context_menu(x, y, hornet_ref, on_quit=None):
             wander_var = tk.BooleanVar(value=tray_globals['wander'])
             pop.add_checkbutton(label='Wander', variable=wander_var,
                                 command=close_run(on_toggle_wander))
+            cursor_look_var = tk.BooleanVar(value=tray_globals['cursor_look'])
+            pop.add_checkbutton(label='Watch Cursor', variable=cursor_look_var,
+                                command=close_run(on_toggle_cursor_look))
             if tray_globals['window_platforms_ok']:
                 platforms_var = tk.BooleanVar(value=tray_globals['window_platforms'])
                 pop.add_checkbutton(label='Climb Windows', variable=platforms_var,
@@ -3582,6 +3803,10 @@ def _create_tray_icon(hwnd, hornet_ref):
         tray_globals['wander'] = not tray_globals['wander']
         _save_config_key('wander', tray_globals['wander'])
 
+    def on_toggle_cursor_look(icon=None, item=None):
+        tray_globals['cursor_look'] = not tray_globals['cursor_look']
+        _save_config_key('cursor_look', tray_globals['cursor_look'])
+
     def on_toggle_window_platforms(icon=None, item=None):
         tray_globals['window_platforms'] = not tray_globals['window_platforms']
         _save_config_key('window_platforms', tray_globals['window_platforms'])
@@ -3657,6 +3882,8 @@ def _create_tray_icon(hwnd, hornet_ref):
                      checked=lambda item: tray_globals['drag_pendulum']),
             MenuItem('Wander', on_toggle_wander,
                      checked=lambda item: tray_globals['wander']),
+            MenuItem('Watch Cursor', on_toggle_cursor_look,
+                     checked=lambda item: tray_globals['cursor_look']),
             MenuItem('Climb Windows', on_toggle_window_platforms,
                      checked=lambda item: tray_globals['window_platforms']),
             MenuItem('Reload Config', on_reload_config),

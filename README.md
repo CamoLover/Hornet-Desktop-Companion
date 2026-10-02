@@ -26,6 +26,7 @@
 - **Sleep** -  after 5 minutes of inactivity on the ground, Hornet falls asleep; a small "z" floats above her head while she sleeps; click her to wake up
 - **Soft landing** -  optional mode where Hornet doesn't bounce; plays a landing animation on the floor, and wall-slide / wall-cling animations against screen edges
 - **Umbrella glide** -  optional landing mode: drop her from high up and she opens her cloak like an umbrella, drifting down slowly with a gentle sway (soft landing still applies on walls and the floor)
+- **Cursor awareness** -  while she stands around, her head follows your cursor: she looks up at it, glances down at it, or turns her head back when it's behind her; whip the cursor past her and she flinches, rest it on her and she leans in to look at you (toggle *Watch Cursor* from the menu)
 - **Taunt** -  hover the cursor near Hornet long enough and she'll get annoyed and taunt you; has a cooldown
 - **Music** -  plays randomised segments of *Needoline* during the sitting loop; stops when she stands
 - **Velocity-reactive sprites** -  fast-fall and tumble sprites trigger based on speed and direction
