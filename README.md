@@ -37,6 +37,7 @@
 - **Cloak recoloring** -  choose from color presets or a custom hex color for Hornet's cloak, from the tray icon
 - **Spawn animation** -  choose whether Hornet falls in from the top or runs in from the left/right edge of the screen on launch
 - **Wandering** -  when left alone she walks around on her own, turns, stops, pulls out her map to read it, and sometimes strolls while reading (toggle from the menu)
+- **Multi-monitor travel** (Windows, Linux X11) -  every now and then she heads over to a neighbouring monitor. Monitor heights matter: she walks straight across when the floors line up, hops or jumps up a small step, climbs the edge and pulls herself up onto a much higher screen, and steps off or jumps down onto a lower one (opening her umbrella on big drops in glide mode). The side of a higher monitor is a real wall, so throwing her into it bounces her off instead of teleporting her up (toggle *Travel Between Monitors* from the menu)
 - **Climbing windows** (Windows, Linux X11) -  your open windows become platforms: she lands on them, climbs their sides, wall-jumps off the screen edge to reach high ones, sits on top, and jumps back down. Move a window and she falls off; close it and she tumbles down
 
 ---

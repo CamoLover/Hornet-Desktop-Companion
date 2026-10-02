@@ -397,6 +397,7 @@ tray_globals = {
     'drag_pendulum': True,     # Swing sprite around grip while dragged
     'wander': True,            # Walk around / read the map on her own while idle
     'cursor_look': True,       # Head follows the cursor, flinches, leans in
+    'monitor_travel': True,    # Wander over to neighbouring monitors
     'window_platforms': True,  # Stand on / climb desktop windows (Windows, Linux X11)
     'window_platforms_ok': PLAT == 'Windows',  # Linux: set once the X11 scanner connects
     'cloak_color': 'default',  # Cloak hue: 'default' or '#RRGGBB'
@@ -1140,6 +1141,7 @@ class Hornet:
     MAP_WALK_STRIDE_PX = 3.7    # px the planted foot travels per map-walk frame (unscaled art)
     WANDER_WALK_DIST   = (150.0, 500.0)  # px range of a walk (unscaled)
     MAP_WALK_DIST      = (60.0, 250.0)   # px range of a walk while reading (unscaled)
+    TRAVEL_CHANCE      = 0.2    # chance an activity on the floor is a trip to another monitor
 
     # Getting around windows: running, jumping, climbing (window_platforms)
     IDLE_FACE_X     = 92.8    # face column in the idle frame (unscaled art)
@@ -1293,6 +1295,7 @@ class Hornet:
         self.wander_map_time  = 0.0     # seconds left reading before deciding what's next
         self.wander_map_walks = 0       # map walks left before putting the map away
         self.wander_gait      = 'walk'  # 'walk' | 'run' for the current goto
+        self.wander_cross     = False   # this goto may leave her monitor (travelling)
 
         # Plans: queued steps ('goto', 'jump', 'climb', 'walljump', 'map', 'sit')
         self.plan         = []
@@ -1315,7 +1318,7 @@ class Hornet:
         self.climb_wall_x = 0.0
         self.climb_side   = 'left'   # which side of her the wall is on
         self.climb_stop_y = 0.0
-        self.climb_ledge  = None     # hwnd of the window to mantle onto at the top
+        self.climb_ledge  = None     # hwnd of the window (or ('monitor', i)) to mantle onto
         self.leap_y0      = 0.0      # y where the current scramble leap started
         self.leap_h       = 0.0      # height of the current scramble leap
         self.leaps_left   = 0        # scramble leaps still needed to reach the top
@@ -2023,8 +2026,11 @@ class Hornet:
         # Source art faces left, so unflipped (facing_right=True) means moving left.
         if abs(self.glide_drift) > 30:
             self.facing_right = self.glide_drift < 0
+        prev_cx = self.x + self._idle_w / 2
         self.x += self.vx * dt
         self.y += self.vy * dt
+        if self._hit_step(prev_cx):
+            self.glide_drift = 0.0
 
         if self.y < self.world_top:
             self.y  = self.world_top
@@ -2425,6 +2431,7 @@ class Hornet:
         self.plan         = []
         self.plan_running = False
         self.wj_target    = None
+        self.wander_cross = False
         self.wander_wait  = max(self.wander_wait, self.WANDER_IDLE_MIN)
 
     def _end_wander(self):
@@ -2433,6 +2440,7 @@ class Hornet:
         self.wander_timer = 0.0
         self.plan         = []
         self.plan_running = False
+        self.wander_cross = False
         self.idle_idx     = 0
         self.idle_timer   = 0.0
         self.wander_wait  = random.uniform(self.WANDER_IDLE_MIN, self.WANDER_IDLE_MAX)
@@ -2447,6 +2455,7 @@ class Hornet:
         self.wander_phase = None
         self.wander_idx   = 0
         self.wander_timer = 0.0
+        self.wander_cross = False
         if not self.plan:
             self._end_wander()
             return
@@ -2473,7 +2482,8 @@ class Hornet:
         if self.plan_running:
             self._next_step()
 
-    def _start_goto(self, x, gait='walk'):
+    def _start_goto(self, x, gait='walk', cross=False):
+        self.wander_cross = cross
         lo, hi = self._wander_bounds()
         x = min(max(x, lo - self._idle_w), hi + self._idle_w)
         if abs(x - self.x) < 3:
@@ -2511,15 +2521,25 @@ class Hornet:
         self.vx, self.vy = vx, vy
         self.support    = None
 
+    def _jump_arc(self, x0, y0, tx, ty, style):
+        """(vx, launch speed up, flight time) of a jump from (x0, y0) to (tx, ty)."""
+        g    = self.GRAVITY
+        lift = {'hop': 0.25, 'jump': 0.45, 'somersault': 0.6, 'walljump': 0.3}[style] * self._idle_h
+        apex = min(y0, ty) - lift
+        up   = math.sqrt(2.0 * g * max(1.0, y0 - apex))
+        t    = up / g + math.sqrt(2.0 * max(0.0, ty - apex) / g)
+        return (tx - x0) / t, up, t
+
+    def _jump_y_at(self, x0, y0, tx, ty, style, xq):
+        """Her top-left y as that jump's top-left x passes xq."""
+        vx, up, _ = self._jump_arc(x0, y0, tx, ty, style)
+        tq = (xq - x0) / vx if abs(vx) > 1e-6 else 0.0
+        return y0 - up * tq + 0.5 * self.GRAVITY * tq * tq
+
     def _start_jump(self, tx, ty, style, catch=None):
         """Ballistic jump so her top-left lands on (tx, ty); with `catch` she
         grabs a wall at (tx, ty) instead and starts that climb step."""
-        g    = self.GRAVITY
-        lift = {'hop': 0.25, 'jump': 0.45, 'somersault': 0.6, 'walljump': 0.3}[style] * self._idle_h
-        apex = min(self.y, ty) - lift
-        up   = math.sqrt(2.0 * g * max(1.0, self.y - apex))
-        t    = up / g + math.sqrt(2.0 * max(0.0, ty - apex) / g)
-        vx   = (tx - self.x) / t
+        vx, up, t = self._jump_arc(self.x, self.y, tx, ty, style)
         self.wander_phase = None
         self._start_air(style, vx, -up)
         if abs(vx) > 1:
@@ -2575,11 +2595,11 @@ class Hornet:
 
     def _start_climb(self, wall_x, side, stop_y, ledge=None, caught=False):
         if ledge is not None:
-            p = self._platform(ledge)
-            if p is None:           # the window is gone: give up on this plan
+            rect = self._ledge_rect(ledge)
+            if rect is None:        # the window is gone: give up on this plan
                 self._end_wander()
                 return
-            self.climb_rect = (p.l, p.t, p.r, p.b)
+            self.climb_rect = rect
         else:
             self.climb_rect = None
         self.climb_wall_x = wall_x
@@ -2610,14 +2630,15 @@ class Hornet:
             self._set_wander_phase('cling')
 
     def _start_mantle(self):
-        p = self._platform(self.climb_ledge)
-        if p is None:
+        rect = self._ledge_rect(self.climb_ledge)
+        if rect is None:
             self._drop('fall')
             return
+        l, t, r, b = rect
         iw = self._idle_w
-        self.y = p.t - self._idle_h
-        # Pull up over the corner onto the window top (ledge on the wall's side)
-        self.x = p.r - iw * 0.75 if self.climb_side == 'left' else p.l - iw * 0.25
+        self.y = t - self._idle_h
+        # Pull up over the corner onto the ledge (on the wall's side)
+        self.x = r - iw * 0.75 if self.climb_side == 'left' else l - iw * 0.25
         self.climb_ledge = None
         self.climb_rect  = None
         self._set_wander_phase('mantle')
@@ -2628,6 +2649,18 @@ class Hornet:
             if p.hwnd == hwnd:
                 return p
         return None
+
+    def _ledge_rect(self, ledge):
+        """(l, t, r, b) of what a climb pulls up onto: a window (its hwnd), or
+        ('monitor', i) for the floor of a neighbouring monitor that sits higher."""
+        if isinstance(ledge, tuple):
+            i = ledge[1]
+            if i >= len(self.monitors):
+                return None
+            ml, mt, mr, mb, wl, wt, wr, wb = self.monitors[i]
+            return ml, wb, mr, mb
+        p = self._platform(ledge)
+        return None if p is None else (p.l, p.t, p.r, p.b)
 
     def _monitor_work(self, cx=None):
         """(left, top, right, bottom) work area of the monitor under x=cx."""
@@ -2641,7 +2674,9 @@ class Hornet:
 
     def _wander_bounds(self):
         """Hard x range (top-left) for walking: the monitor she's on, so she never
-        walks onto a monitor with another floor."""
+        walks onto a monitor with another floor (unless she's travelling there)."""
+        if self.wander_cross:
+            return self.world_left, self.world_left + self.world_w - self._idle_w
         wl, wt, wr, wb = self._monitor_work()
         lo = max(self.world_left, wl)
         hi = min(self.world_left + self.world_w, wr) - self._idle_w
@@ -2708,7 +2743,9 @@ class Hornet:
             elif r < 0.92:
                 plan = [('map',)]
         else:
-            if explore_ok and r < 0.35:
+            if tray_globals.get('monitor_travel', True) and random.random() < self.TRAVEL_CHANCE:
+                plan = self._plan_travel()
+            if plan is None and explore_ok and r < 0.35:
                 plan = self._plan_explore()
             if plan is None:
                 r2 = random.random()
@@ -2870,6 +2907,133 @@ class Hornet:
             return [('goto', take_x, self._gait(take_x)),
                     ('jump', land_cx - iw / 2, ground_y, style)]
         return None
+
+    # ── travelling between monitors ──
+    def _monitor_index(self, cx):
+        """Index of the monitor whose column contains x=cx, or None over a gap."""
+        for i, m in enumerate(self.monitors):
+            if m[0] <= cx < m[2]:
+                return i
+        return None
+
+    def _neighbours(self, i):
+        """Monitors sharing a vertical edge with monitor i: (j, dir, edge_x) list."""
+        ml, mt, mr, mb = self.monitors[i][:4]
+        out = []
+        for j, m in enumerate(self.monitors):
+            if j == i:
+                continue
+            if abs(m[0] - mr) <= 2:
+                d, e = 1, mr
+            elif abs(m[2] - ml) <= 2:
+                d, e = -1, ml
+            else:
+                continue
+            if min(mb, m[3]) - max(mt, m[1]) > 0:   # not just touching at a corner
+                out.append((j, d, e))
+        return out
+
+    def _plan_travel(self):
+        """Walk, jump or climb over to a neighbouring monitor, then stroll in."""
+        if self.support is not None or len(self.monitors) < 2:
+            return None
+        iw = self._idle_w
+        i = self._monitor_index(self.x + iw / 2)
+        if i is None:
+            return None
+        options = self._neighbours(i)
+        random.shuffle(options)
+        for j, d, e in options:
+            route = self._cross_route(self.monitors[i], self.monitors[j], j, d, e)
+            if route:
+                wl, wr = self.monitors[j][4], self.monitors[j][6]
+                into = e + d * iw * random.uniform(1.5, 5.0) - iw / 2
+                into = min(max(into, wl + iw * 0.3), wr - iw * 1.3)
+                return route + [('goto', into, 'walk')] + self._after_arrival()
+        return None
+
+    def _cross_route(self, cur, new, j, d, e):
+        """Steps that get her from her monitor `cur` over the shared edge x=e (in
+        direction d) onto monitor `new` (index j), using the height between the two
+        floors: walk across, hop or jump up, climb the step, or drop / jump down."""
+        iw, ih = self._idle_w, self._idle_h
+        cml, cmt, cmr, cmb, cwl, cwt, cwr, cwb = cur
+        nml, nmt, nmr, nmb, nwl, nwt, nwr, nwb = new
+        # Both work areas must reach the edge (no side taskbar in the way)
+        if d > 0 and (cwr < e - 2 or nwl > e + 2):
+            return None
+        if d < 0 and (cwl > e + 2 or nwr < e - 2):
+            return None
+        feet  = self.y + ih
+        floor = nwb - ih                    # her top-left y standing on the next monitor
+        rise  = feet - nwb                  # > 0: the next floor is higher
+        if floor < nmt:
+            return None                     # no room to stand over there
+
+        if abs(rise) <= 2:
+            # Level: just walk across
+            tx = e + d * iw * random.uniform(1.0, 3.0) - iw / 2
+            return [('goto', tx, self._gait(tx), True)]
+
+        if rise < 0:
+            # Lower: step off the edge, or jump down
+            if feet - ih * 0.5 < nmt:
+                return None                 # she'd step off into nothing visible
+            if -rise > ih * 0.3 and random.random() < 0.5:
+                return [('goto', e + d * iw * 0.6 - iw / 2, 'walk', True)]
+            take_x = e - d * iw * 0.35 - iw / 2
+            land_x = e + d * iw * random.uniform(0.9, 2.5) - iw / 2
+            style = ('somersault' if -rise > ih * 2.0
+                     else 'hop' if -rise < ih * 0.3 else 'jump')
+            # Must be over the edge before coming back down to this floor
+            if self._jump_y_at(take_x, self.y, land_x, floor, style, e - iw / 2) > self.y:
+                return None
+            return [('goto', take_x, self._gait(take_x)),
+                    ('jump', land_x, floor, style)]
+
+        if rise <= ih * 1.25:
+            # A bit higher: hop / jump up, clearing the step's corner
+            style = 'hop' if rise < ih * 0.35 else 'jump'
+            for d1, d2 in ((0.9, 0.6), (1.4, 0.5), (2.0, 0.5)):
+                take_x = e - d * iw * d1 - iw / 2
+                land_x = e + d * iw * d2 - iw / 2
+                if self._jump_y_at(take_x, self.y, land_x, floor, style, e - iw / 2) <= floor:
+                    return [('goto', take_x, self._gait(take_x)),
+                            ('jump', land_x, floor, style)]
+            return None
+
+        # Much higher: climb the step at the edge and pull up onto the next floor
+        stop_y = nwb - ih * 0.55
+        if stop_y < cwt:
+            return None                     # the step is taller than her screen
+        if d > 0:
+            side, stand_x = 'right', e - iw * 0.85    # wall on her right
+        else:
+            side, stand_x = 'left', e - iw * 0.15     # wall on her left
+        return [('goto', stand_x, self._gait(stand_x), True),
+                ('climb', e, side, stop_y, ('monitor', j))]
+
+    def _step_wall(self, prev_cx):
+        """Crossing onto another monitor below its floor: the step between them is
+        a wall. Returns that edge's x, or None if she can pass."""
+        if len(self.monitors) < 2:
+            return None
+        cx = self.x + self._idle_w / 2
+        a, b = self._monitor_index(prev_cx), self._monitor_index(cx)
+        if a is None or b is None or a == b:
+            return None
+        if self.y + self._idle_h <= self.monitors[b][7] + 2:
+            return None
+        return self.monitors[a][2] if cx > prev_cx else self.monitors[a][0]
+
+    def _hit_step(self, prev_cx):
+        """Push her back out of a step wall; returns the bounce direction or 0."""
+        wall = self._step_wall(prev_cx)
+        if wall is None:
+            return 0
+        d = 1 if self.x + self._idle_w / 2 > prev_cx else -1
+        self.x = wall - self._idle_w / 2 - d
+        return -d
 
     # ── per-tick ──
     def _wander_walk_step(self, dt, stride_px, fps, factor=1.0):
@@ -3039,7 +3203,8 @@ class Hornet:
                 self._drop('fall')
             else:
                 self.support = new
-        if self.climb_rect is not None and self.climb_ledge is not None:
+        if (self.climb_rect is not None and self.climb_ledge is not None
+                and not isinstance(self.climb_ledge, tuple)):   # monitor floors don't move
             new = by_hwnd.get(self.climb_ledge)
             if new is None:
                 self._drop('weak_fall')
@@ -3176,9 +3341,14 @@ class Hornet:
             self._tick_air(dt)
         elif abs(self.vx) > 30:
             self.facing_right = self.vx > 0
+        prev_cx = self.x + self._idle_w / 2
         self.vy += self.GRAVITY * dt
         self.x  += self.vx * dt
         self.y  += self.vy * dt
+        # The side of a higher neighbouring monitor is a wall, not a teleporter
+        bounce = self._hit_step(prev_cx)
+        if bounce:
+            self.vx = 0.0 if self.air_anim is not None else bounce * abs(self.vx) * self.BOUNCE_DAMP
         soft = tray_globals.get('land_mode', 'bounce') in ('soft', 'glide')
         if self.y >= self.floor_y:
             self.y = self.floor_y
@@ -3393,6 +3563,7 @@ _CONFIG_DEFAULTS = {
     'glide_fps':        0.07,
     'wander':           True,
     'cursor_look':      True,
+    'monitor_travel':   True,
     'wander_idle_min':  4.0,
     'wander_idle_max':  12.0,
     'wander_walk_fps':  0.07,
@@ -3526,6 +3697,7 @@ def load_config(apply_volume=False):
     tray_globals['drag_pendulum'] = bool(cfg['drag_pendulum'])
     tray_globals['wander']      = bool(cfg['wander'])
     tray_globals['cursor_look'] = bool(cfg['cursor_look'])
+    tray_globals['monitor_travel'] = bool(cfg['monitor_travel'])
     tray_globals['window_platforms'] = bool(cfg['window_platforms'])
     tray_globals['cloak_color'] = CLOAK_COLOR
     sm = str(cfg['spawn_mode'])
@@ -3630,6 +3802,10 @@ def _show_context_menu(x, y, hornet_ref, on_quit=None):
                 tray_globals['cursor_look'] = not tray_globals['cursor_look']
                 _save_config_key('cursor_look', tray_globals['cursor_look'])
 
+            def on_toggle_monitor_travel():
+                tray_globals['monitor_travel'] = not tray_globals['monitor_travel']
+                _save_config_key('monitor_travel', tray_globals['monitor_travel'])
+
             def on_toggle_window_platforms():
                 tray_globals['window_platforms'] = not tray_globals['window_platforms']
                 _save_config_key('window_platforms', tray_globals['window_platforms'])
@@ -3714,6 +3890,10 @@ def _show_context_menu(x, y, hornet_ref, on_quit=None):
             cursor_look_var = tk.BooleanVar(value=tray_globals['cursor_look'])
             pop.add_checkbutton(label='Watch Cursor', variable=cursor_look_var,
                                 command=close_run(on_toggle_cursor_look))
+            if len(MONITORS) > 1:
+                travel_var = tk.BooleanVar(value=tray_globals['monitor_travel'])
+                pop.add_checkbutton(label='Travel Between Monitors', variable=travel_var,
+                                    command=close_run(on_toggle_monitor_travel))
             if tray_globals['window_platforms_ok']:
                 platforms_var = tk.BooleanVar(value=tray_globals['window_platforms'])
                 pop.add_checkbutton(label='Climb Windows', variable=platforms_var,
@@ -3807,6 +3987,10 @@ def _create_tray_icon(hwnd, hornet_ref):
         tray_globals['cursor_look'] = not tray_globals['cursor_look']
         _save_config_key('cursor_look', tray_globals['cursor_look'])
 
+    def on_toggle_monitor_travel(icon=None, item=None):
+        tray_globals['monitor_travel'] = not tray_globals['monitor_travel']
+        _save_config_key('monitor_travel', tray_globals['monitor_travel'])
+
     def on_toggle_window_platforms(icon=None, item=None):
         tray_globals['window_platforms'] = not tray_globals['window_platforms']
         _save_config_key('window_platforms', tray_globals['window_platforms'])
@@ -3884,6 +4068,9 @@ def _create_tray_icon(hwnd, hornet_ref):
                      checked=lambda item: tray_globals['wander']),
             MenuItem('Watch Cursor', on_toggle_cursor_look,
                      checked=lambda item: tray_globals['cursor_look']),
+            MenuItem('Travel Between Monitors', on_toggle_monitor_travel,
+                     checked=lambda item: tray_globals['monitor_travel'],
+                     visible=len(MONITORS) > 1),
             MenuItem('Climb Windows', on_toggle_window_platforms,
                      checked=lambda item: tray_globals['window_platforms']),
             MenuItem('Reload Config', on_reload_config),
