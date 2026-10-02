@@ -1305,6 +1305,7 @@ class Hornet:
         self.platforms  = []     # Platform list from the last window scan
         self.support    = None   # Platform she's standing on (None = monitor floor)
         self.floor_plat = None   # Platform the current floor_y belongs to
+        self.covered_scans = 0   # window scans in a row her ledge was hidden under another
 
         # Airborne on her own (jumps, drops): None|'jump'|'hop'|'somersault'|
         #                                      'walljump'|'fall'|'weak_fall'
@@ -3189,12 +3190,15 @@ class Hornet:
 
     def set_platforms(self, plats):
         """New window scan. If the window she's on (or climbing) moved, she falls
-        off; if it closed or was minimized, she drops in a tumble."""
+        off; if it closed, was minimized or got buried under another window (e.g.
+        one opened maximized on top of it), she drops in a tumble."""
         self.platforms = plats
         by_hwnd = {p.hwnd: p for p in plats}
+        covered = False
         if self.support is not None:
             old, new = self.support, by_hwnd.get(self.support.hwnd)
             cx = self.x + self._idle_w / 2
+            tol = self._idle_w * 0.2
             if new is None:
                 self._drop('weak_fall')
             elif (abs(new.t - old.t) > 2
@@ -3203,6 +3207,7 @@ class Hornet:
                 self._drop('fall')
             else:
                 self.support = new
+                covered = not any(a - tol <= cx <= b + tol for a, b in new.segs)
         if (self.climb_rect is not None and self.climb_ledge is not None
                 and not isinstance(self.climb_ledge, tuple)):   # monitor floors don't move
             new = by_hwnd.get(self.climb_ledge)
@@ -3210,6 +3215,14 @@ class Hornet:
                 self._drop('weak_fall')
             elif any(abs(u - v) > 2 for u, v in zip((new.l, new.t, new.r, new.b), self.climb_rect)):
                 self._drop('fall')
+            else:
+                covered = not new.segs
+        # Hidden behind a window above: wait one more scan so a passing tooltip or
+        # popup menu doesn't knock her off, then the ledge is gone
+        self.covered_scans = self.covered_scans + 1 if covered else 0
+        if self.covered_scans >= 2:
+            self.covered_scans = 0
+            self._drop('weak_fall')
 
     def _drop(self, kind):
         """The ground (or wall) went away under her: stop everything and fall."""
