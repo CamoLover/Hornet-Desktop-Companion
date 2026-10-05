@@ -1099,6 +1099,15 @@ SIT_Y_OFFSET  = 0.235
 IDLE_Y_OFFSET = -0.075
 SLEEP_Y_OFFSET = 0.12
 Z_OVERHEAD    = 70   # headroom (px at 100% scale) above sprite for sleeping Z particles
+# Windows: slack (px at 100% scale) around the largest frame, so the window can stay
+# anchored on her feet while frames of different sizes are drawn inside it
+WIN_PAD_X      = 100
+WIN_PAD_BOTTOM = 80
+
+def _win_window_size(w, h):
+    """Size of the sprite-tracking window on Windows for a largest frame of w x h."""
+    return (w + 2 * int(WIN_PAD_X * SPRITE_SCALE),
+            h + int((Z_OVERHEAD + WIN_PAD_BOTTOM) * SPRITE_SCALE))
 
 
 class ZParticle:
@@ -1176,6 +1185,7 @@ class Hornet:
     LOOK_RADIUS     = 5.0     # reacts to the cursor within this distance (x her height)
     LOOK_SETTLE     = 0.2     # seconds the cursor must stay in a zone before she reacts
     LOOK_MIN_HOLD   = 0.6     # seconds a pose is held at least before switching
+    LOOK_NEUTRAL    = 0.2     # seconds of plain idle between two poses
     LOOK_UP_DEG     = 60.0    # cursor angle above her head for the full look up
     LOOK_HALF_DEG   = 22.0    # ... for the half look up
     LOOK_DOWN_DEG   = -20.0   # cursor angle below her head for the slight look down
@@ -1347,6 +1357,8 @@ class Hornet:
         self.look_want     = None   # pose the cursor currently asks for
         self.look_want_t   = 0.0    # ... and for how long it has
         self.lean_t        = 0.0    # seconds the cursor has rested on her
+        self.look_release  = False  # something else wants to start: ease back to neutral
+        self.look_gap      = 0.0    # seconds of plain idle left before the next pose
         self.flinch_cd     = 0.0
         self.cursor_prev   = None   # last (mx, my), for cursor speed
         self.cursor_speed  = 0.0    # px/sec, smoothed
@@ -2207,6 +2219,7 @@ class Hornet:
         self.look_want   = None
         self.look_want_t = 0.0
         self.lean_t      = 0.0
+        self.look_gap    = 0.0
 
     def _track_cursor(self, dt, mx, my):
         """Smoothed cursor speed, measured every frame so it never spikes on resume."""
@@ -2219,9 +2232,9 @@ class Hornet:
             self.cursor_speed += (inst - self.cursor_speed) * min(1.0, dt * 20.0)
         self.cursor_prev = (mx, my)
 
-    def _look_allowed(self, mx, my):
-        return (tray_globals.get('cursor_look', True) and mx is not None and my is not None
-                and self.state == 'IDLE' and not self.dragging
+    def _look_allowed(self):
+        """Standing still with nothing else going on, so a look pose can play."""
+        return (self.state == 'IDLE' and not self.dragging
                 and self.walk_in_phase is None and self.sleep_phase is None
                 and self.taunt_phase is None and self.sit_phase is None
                 and self.land_phase is None and self.glide_phase is None
@@ -2256,17 +2269,20 @@ class Hornet:
         return None
 
     def _update_look(self, dt, mx, my):
+        """mx/my None (cursor gone or Watch Cursor off): just ease back to neutral."""
         self.flinch_cd = max(0.0, self.flinch_cd - dt)
+        self.look_gap  = max(0.0, self.look_gap - dt)
+        cursor = mx is not None and my is not None
         h  = self._idle_h
         cx = self.x + self._idle_w / 2
         cy = self.y + h / 2
-        if self.is_clicked(mx, my) and self.cursor_speed < self.LEAN_STILL_SPD:
+        if cursor and self.is_clicked(mx, my) and self.cursor_speed < self.LEAN_STILL_SPD:
             self.lean_t += dt
         else:
             self.lean_t = 0.0
 
         # Startled by the cursor whipping past close by
-        if (self.cursor_speed >= self.FLINCH_SPEED and self.flinch_cd <= 0
+        if (cursor and self.cursor_speed >= self.FLINCH_SPEED and self.flinch_cd <= 0
                 and self.look_pose != 'flinch'
                 and math.hypot(mx - cx, my - cy) <= h * self.FLINCH_RANGE):
             self._set_look('flinch')
@@ -2284,7 +2300,7 @@ class Hornet:
                 if self.look_idx >= len(self._look_frames()):
                     if self.look_pose == 'flinch':
                         # The flinch recovers into a wary half look up
-                        self._set_look('up_half', 'loop')
+                        self._set_look('up_half')
                     elif self.look_phase == 'enter':
                         self.look_phase, self.look_idx = 'loop', 0
                     elif self.look_phase == 'loop':
@@ -2292,7 +2308,18 @@ class Hornet:
                     else:
                         self.look_pose, self.look_idx = None, 0
                         self.idle_idx, self.idle_timer = 0, 0.0
+                        # Settle on the plain idle before any next pose: the in-between
+                        # frames of two poses don't match, so chaining them pops
+                        self.look_gap = self.LOOK_NEUTRAL
         if self.look_pose == 'flinch':
+            return
+
+        if self.look_release or not cursor:
+            # Wander/sleep/taunt is waiting, or there's nothing to look at: turn the
+            # head back first so whatever is next starts from the neutral idle
+            self.look_want, self.look_want_t = None, 0.0
+            if self.look_pose is not None and self.look_phase != 'exit':
+                self.look_phase, self.look_idx, self.look_timer = 'exit', 0, 0.0
             return
 
         # Debounced so she doesn't twitch when the cursor sits on a zone border
@@ -2304,7 +2331,7 @@ class Hornet:
         if self.look_want_t < self.LOOK_SETTLE:
             return
         if self.look_pose is None:
-            if want is not None:
+            if want is not None and self.look_gap <= 0:
                 self._set_look(want)
         elif (self.look_phase != 'exit' and want != self.look_pose
                 and self.look_hold >= self.LOOK_MIN_HOLD):
@@ -3310,7 +3337,8 @@ class Hornet:
             cy = self.y + self._idle_h / 2
             if math.hypot(mx - cx, my - cy) <= self._idle_w:
                 self.taunt_hover_timer += dt
-                if self.taunt_hover_timer >= self.TAUNT_HOVER_TIME:
+                if (self.taunt_hover_timer >= self.TAUNT_HOVER_TIME
+                        and self.look_pose is None):
                     self._start_taunt()
                     return
             else:
@@ -3319,8 +3347,14 @@ class Hornet:
             self.taunt_hover_timer = 0.0
 
         # Cursor awareness: head follows the cursor while she stands around
-        if self._look_allowed(mx, my):
-            self._update_look(dt, mx, my)
+        self.look_release = ((tray_globals.get('wander', True) and self.wander_wait <= 0)
+                             or self.inactivity_timer >= self.SLEEP_TIMEOUT
+                             or self.taunt_hover_timer >= self.TAUNT_HOVER_TIME)
+        if self._look_allowed():
+            if tray_globals.get('cursor_look', True):
+                self._update_look(dt, mx, my)
+            else:
+                self._update_look(dt, None, None)
             if self.lean_t > 0 or self.look_pose in ('down', 'flinch'):
                 # You're paying attention to her: don't wander off or doze
                 self.wander_wait = max(self.wander_wait, self.WANDER_IDLE_MIN)
@@ -3335,7 +3369,7 @@ class Hornet:
         # Inactivity sleep: only count when resting on the ground
         if self.is_on_ground():
             self.inactivity_timer += dt
-            if self.inactivity_timer >= self.SLEEP_TIMEOUT:
+            if self.inactivity_timer >= self.SLEEP_TIMEOUT and self.look_pose is None:
                 self._start_sleep()
                 return
             # Wander brain: after standing still a while, pick something to do
@@ -3343,7 +3377,7 @@ class Hornet:
                     and not self.plan_running and self.air_anim is None
                     and abs(self.vx) < 5 and self.vy == 0.0):
                 self.wander_wait -= dt
-                if self.wander_wait <= 0:
+                if self.wander_wait <= 0 and self.look_pose is None:
                     self._choose_wander()
                     if self.wander_phase is not None:
                         return
@@ -4391,7 +4425,7 @@ def main():
     # On Windows use a small sprite-sized window; tracking it is much faster
     # than compositing a full-screen layered window every frame via GDI.
     if PLAT == 'Windows':
-        screen = pygame.display.set_mode((win_w, win_h + int(Z_OVERHEAD * SPRITE_SCALE)), pygame.NOFRAME)
+        screen = pygame.display.set_mode(_win_window_size(win_w, win_h), pygame.NOFRAME)
     else:
         screen = pygame.display.set_mode((screen_w, screen_h), pygame.NOFRAME)
     pygame.display.set_caption('Hornet')
@@ -4528,6 +4562,7 @@ def main():
 
     running = True
     platform_timer = 0.0
+    win_pos = None   # Windows: where the window was last moved to
     while running and tray_globals['running']:
         dt = min(clock.tick(60) / 1000.0, 0.05)
 
@@ -4635,7 +4670,8 @@ def main():
                 all_scaled = list(new_sprites.values()) + [s for sq in new_seqs.values() for s in sq]
                 new_w = max(s.get_width()  for s in all_scaled)
                 new_h = max(s.get_height() for s in all_scaled)
-                screen = pygame.display.set_mode((new_w, new_h + int(Z_OVERHEAD * SPRITE_SCALE)), pygame.NOFRAME)
+                screen = pygame.display.set_mode(_win_window_size(new_w, new_h), pygame.NOFRAME)
+                win_pos = None
                 hwnd = pygame.display.get_wm_info()['window']
                 tray_globals['hwnd'] = hwnd
                 _win_setup(hwnd)
@@ -4647,9 +4683,8 @@ def main():
         # Render
         if PLAT == 'Windows':
             u32 = ctypes.windll.user32
-            z_oh = int(Z_OVERHEAD * SPRITE_SCALE)
             frame = hornet.display_frame()
-            frame_x = (screen.get_width() - frame.get_width()) // 2
+            sw, sh = screen.get_size()
             if hornet.dragging:
                 # Follow the *rotated* bounding box, not the unrotated draw_pos:
                 # a big rotation (e.g. grabbed by the feet) swings the sprite far
@@ -4660,16 +4695,26 @@ def main():
                 piv_wy = hornet.y - hornet._off_y
                 sprite_cx = piv_wx + (min_x + max_x) * 0.5
                 sprite_cy = piv_wy + (min_y + max_y) * 0.5
-                win_left  = int(sprite_cx - screen.get_width()  * 0.5)
-                win_top   = int(sprite_cy - screen.get_height() * 0.5)
-                u32.SetWindowPos(hwnd, 0, win_left, win_top, 0, 0, 0x0015)
-                draw_x, draw_y = win_left + frame_x, win_top + z_oh  # unused visually now
+                win_left  = int(sprite_cx - sw * 0.5)
+                win_top   = int(sprite_cy - sh * 0.5)
             else:
                 draw_x, draw_y = hornet.draw_pos()
-                # Move the small window to follow the sprite. Window is positioned
-                # Z_OVERHEAD pixels above the sprite so Z particles have room to
-                # float upward without being clipped.
-                u32.SetWindowPos(hwnd, 0, draw_x - frame_x, draw_y - z_oh, 0, 0, 0x0015)
+                # Anchor the window on her feet (idle frame centre-bottom), not on the
+                # frame: frames differ in size, and moving the window by that much
+                # lets Windows show the old image at the new spot for a frame (she
+                # blinks out or drops under the taskbar). Changing frames then only
+                # moves the blit inside the window, which lands in the same flip.
+                win_left = int(hornet.x) + hornet._idle_w // 2 - sw // 2
+                win_top  = (int(hornet.y) + hornet._idle_h
+                            - (sh - int(WIN_PAD_BOTTOM * SPRITE_SCALE)))
+                # Odd frames (wall climbs, glide) that would poke out: slide just enough
+                fw, fh = frame.get_size()
+                win_left = min(max(win_left, draw_x + fw - sw), draw_x)
+                win_top  = min(max(win_top,  draw_y + fh - sh), draw_y)
+                frame_x, frame_y = draw_x - win_left, draw_y - win_top
+            if (win_left, win_top) != win_pos:
+                u32.SetWindowPos(hwnd, 0, win_left, win_top, 0, 0, 0x0015)
+                win_pos = (win_left, win_top)
             if tray_globals['topmost'] and u32.GetWindow(hwnd, 3):
                 # Something is above Hornet -  reassert unless a menu or capturing
                 # popup is active (GetGUIThreadInfo catches Win32 menus incl.
@@ -4680,14 +4725,14 @@ def main():
                 if not (gti.flags & _GUI_INMENUMODE) and not u32.GetCapture():
                     _win_assert_topmost(hwnd)
             screen.fill(CHROMA_KEY)
-            hornet.draw_taunt_silk(screen, frame_x, z_oh)
             if hornet.dragging:
                 piv_wx = hornet.x - hornet._off_x
                 piv_wy = hornet.y - hornet._off_y
                 hornet._blit_rotated(screen, piv_wx - win_left, piv_wy - win_top)
             else:
-                screen.blit(frame, (frame_x, z_oh))
-            hornet.draw_z_particles(screen, frame_x, z_oh)
+                hornet.draw_taunt_silk(screen, frame_x, frame_y)
+                screen.blit(frame, (frame_x, frame_y))
+                hornet.draw_z_particles(screen, frame_x, frame_y)
         elif ARGB_MODE and offscreen:
             render_argb(screen, offscreen, hornet)
         else:
